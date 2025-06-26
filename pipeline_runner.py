@@ -246,7 +246,7 @@ def main():
     parser.add_argument('--stages', type=int, nargs='*', default=[1],
                        help='Stages to run (1-5), default: [1]')
     parser.add_argument('--config', type=str, choices=['fast', 'balanced', 'accurate'], 
-                       default='balanced', help='Processing configuration')
+                       default='accurate', help='Processing configuration')
     
     args = parser.parse_args()
     

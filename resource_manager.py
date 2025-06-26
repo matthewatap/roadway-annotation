@@ -352,7 +352,7 @@ class SafePipelineRunner:
         self.monitor.cleanup_memory()
 
 # Convenience function for easy use
-def run_safe_pipeline(video_name: str = None, conservative: bool = True, gpu_type: str = "auto"):
+def run_safe_pipeline(video_name: str = None, conservative: bool = False, gpu_type: str = "auto"):
     """Run pipeline safely on runpod"""
     
     # Get available videos
@@ -392,15 +392,20 @@ def run_safe_pipeline(video_name: str = None, conservative: bool = True, gpu_typ
             print("🚀 L4 CONSERVATIVE: Enhanced PyTorch with temporal smoothing")
         else:
             config = RoadDetectionConfig(
-                model_type="transformers",  # L4 can handle SegFormer
-                conf_threshold=0.5,
+                model_type="transformers",  # SegFormer-B5 for best accuracy
+                conf_threshold=0.77,
                 temporal_smooth=True,
                 edge_refinement=True,
-                advanced_edge_refinement=True,
-                multi_scale=False,
-                scales=[1.0]
+                advanced_edge_refinement=True,  # Enhanced edge refinement
+                confidence_edge_threshold=0.85,  # Higher confidence at edges
+                multi_class_awareness=True,      # Use other classes to constrain roads
+                geometric_filtering=True,        # Geometric constraints
+                bilateral_filter=True,           # Edge-preserving smoothing
+                perspective_correction=True,
+                multi_scale=True,
+                scales=[0.75, 1.0, 1.25]        # Multi-scale processing
             )
-            print("⚡ L4 PERFORMANCE: SegFormer with advanced features")
+            print("⚡ L4 ACCURATE: Full SegFormer with multi-scale processing")
     else:
         # Generic/conservative settings for other GPUs
         if conservative:
@@ -450,5 +455,5 @@ if __name__ == "__main__":
     print("🚀 Safe Pipeline Runner for Runpod L4")
     print("=" * 50)
     
-    # Auto-detect L4 and run optimized settings
-    run_safe_pipeline(conservative=True, gpu_type="auto") 
+    # Auto-detect L4 and run accurate settings by default
+    run_safe_pipeline(conservative=False, gpu_type="auto") 

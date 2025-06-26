@@ -47,8 +47,8 @@ python pipeline_runner.py --list
 # Process single video (fast)
 python pipeline_runner.py --videos "Road_Lane.mp4" --config fast
 
-# Process all videos (balanced quality)
-python pipeline_runner.py --all --config balanced
+# Process all videos (accurate quality - default)
+python pipeline_runner.py --all
 
 # High accuracy mode
 python pipeline_runner.py --all --config accurate --stages 1 2
@@ -78,16 +78,17 @@ roadway-annotation/
 - ~15-20 FPS processing speed
 - Good for quick previews
 
-### **Balanced Mode** ⚖️ (Default)
+### **Balanced Mode** ⚖️
 - PyTorch DeepLabV3 with enhancements
 - Temporal smoothing + edge refinement
 - ~8-12 FPS processing speed
-- Best quality/speed tradeoff
+- Good quality/speed tradeoff
 
-### **Accurate Mode** 🎯
-- HuggingFace SegFormer-B5 (large model)
-- Advanced edge refinement
-- Multi-class awareness
+### **Accurate Mode** 🎯 (Default)
+- HuggingFace SegFormer-B5 (transformer model)
+- Multi-scale processing (0.75x, 1.0x, 1.25x)
+- Advanced edge refinement + geometric filtering
+- Multi-class awareness + perspective correction
 - ~3-5 FPS processing speed
 - Highest quality results
 

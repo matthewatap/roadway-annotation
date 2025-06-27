@@ -413,9 +413,16 @@ class RoadDetectionConfig:
     multi_class_awareness: bool = False     # Use other classes to constrain roads
     bilateral_filter: bool = False          # Edge-preserving smoothing
     
-    # NEW: Fast video processing options
+    # Fast video processing options
     max_resolution: int = 1024  # Resize large images for speed
     fast_processing: bool = True  # Enable fast video mode
+    
+    # L4 GPU OPTIMIZATIONS
+    use_fp16: bool = False          # Mixed precision for L4 tensor cores
+    batch_size: int = 1             # Batch processing for better GPU utilization
+    use_tensorrt: bool = False      # TensorRT optimization (requires setup)
+    use_torch_compile: bool = False # PyTorch 2.0 compilation speedup
+    memory_efficient: bool = False  # Memory optimization techniques
     
     def __post_init__(self):
         if self.scales is None:
@@ -449,21 +456,12 @@ def create_fast_video_config():
     )
 
 def create_improved_accurate_config():
-    """Create the unified accurate configuration - trust the model's semantic understanding"""
-    return RoadDetectionConfig(
-        model_type="transformers",       # SegFormer-B5 - trained on Cityscapes, knows road vs non-road
-        conf_threshold=0.5,             # Trust the model - reasonable threshold
-        temporal_smooth=True,
-        edge_refinement=True,
-        advanced_edge_refinement=False,  # Let the model do its job
-        confidence_edge_threshold=0.6,   # Reasonable edge confidence
-        multi_class_awareness=True,      # Use semantic classes properly (not for aggressive filtering)
-        geometric_filtering=False,       # Trust the model's spatial understanding
-        bilateral_filter=False,          # Trust the model's edge detection
-        perspective_correction=False,    # Trust the model's perspective understanding
-        multi_scale=True,               # Keep multi-scale for robustness
-        scales=[0.75, 1.0, 1.25]       # Multi-scale helps with different road sizes
-    )
+    """Create the unified accurate configuration - trust the model's semantic understanding
+    
+    NOTE: This now defaults to L4-balanced settings for best quality/performance ratio.
+    Use create_l4_optimized_config() for maximum speed or create_github_exact_accurate_config() for original.
+    """
+    return create_l4_balanced_config()  # Use L4 balanced config by default
 
 def create_github_exact_accurate_config():
     """Create the EXACT GitHub 'accurate' configuration (very aggressive, precision-focused)"""
@@ -480,6 +478,60 @@ def create_github_exact_accurate_config():
         perspective_correction=True,
         multi_scale=True,
         scales=[0.75, 1.0, 1.25]
+    )
+
+def create_l4_optimized_config():
+    """Create L4-optimized configuration for maximum performance without sacrificing quality"""
+    return RoadDetectionConfig(
+        model_type="transformers",       # SegFormer-B5 - but with L4 optimizations
+        conf_threshold=0.5,             # Trust the model
+        temporal_smooth=True,
+        edge_refinement=True,
+        advanced_edge_refinement=False,  # Disabled for speed
+        confidence_edge_threshold=0.6,   
+        multi_class_awareness=True,      # Keep for person safety
+        geometric_filtering=False,       # Disabled for speed
+        bilateral_filter=False,          # Disabled for speed
+        perspective_correction=False,    # Disabled for speed
+        
+        # L4 OPTIMIZATIONS:
+        multi_scale=False,              # MAJOR: Single scale for 3x speed boost
+        scales=[1.0],                   # Single scale only
+        max_resolution=1024,            # L4 sweet spot resolution
+        fast_processing=True,           # Enable L4 optimizations
+        use_fp16=True,                  # Mixed precision for L4 tensor cores
+        batch_size=4,                   # Process multiple frames at once
+        use_tensorrt=False,             # Optional TensorRT optimization
+        use_torch_compile=True,         # PyTorch 2.0 compilation
+        memory_efficient=True,          # L4 memory optimization
+    )
+
+def create_l4_balanced_config():
+    """Create L4-balanced configuration: Best quality/performance ratio for production use"""
+    return RoadDetectionConfig(
+        model_type="transformers",       # SegFormer-B5 - excellent for L4
+        conf_threshold=0.5,             # Trust the model
+        temporal_smooth=True,
+        edge_refinement=True,
+        advanced_edge_refinement=False,  # Skip for speed
+        confidence_edge_threshold=0.6,   
+        multi_class_awareness=True,      # Keep for person safety
+        geometric_filtering=False,       # Skip for speed
+        bilateral_filter=False,          # Skip for speed
+        perspective_correction=False,    # Skip for speed
+        
+        # BALANCED PERFORMANCE:
+        multi_scale=True,               # Keep for quality (GitHub was right!)
+        scales=[0.9, 1.0, 1.1],        # Smaller range - 3x processing but better coverage
+        max_resolution=1024,            # L4 optimal resolution
+        fast_processing=True,
+        
+        # L4 OPTIMIZATIONS (refined):
+        use_fp16=True,                  # Mixed precision for L4 tensor cores
+        batch_size=1,                   # Single frame for now
+        use_tensorrt=False,             # Skip - setup complexity
+        use_torch_compile=False,        # Skip - compilation overhead too high
+        memory_efficient=True,          # L4 memory optimization
     )
 
 def improve_road_coverage(road_mask, confidence_map, expand_ratio=1.2):
@@ -658,6 +710,20 @@ class ModernRoadDetector:
             self.model.to(self.device)
             self.model.eval()
             self.model_type = "transformers"
+            
+            # L4 OPTIMIZATIONS
+            if self.config.use_fp16 and self.device.type == 'cuda':
+                print("🚀 Enabling FP16 mixed precision for L4 tensor cores")
+                self.model = self.model.half()
+                
+            if self.config.use_torch_compile and hasattr(torch, 'compile'):
+                print("🚀 Enabling PyTorch 2.0 compilation")
+                self.model = torch.compile(self.model, mode='max-autotune')
+                
+            if self.config.memory_efficient:
+                print("🚀 Enabling memory efficient operations")
+                torch.backends.cudnn.benchmark = True
+                
             print(f"Using transformers for road detection")
         else:
             raise ValueError(f"Unknown model type: {self.config.model_type}")
@@ -710,25 +776,84 @@ class ModernRoadDetector:
         return road_mask, confidence_map
     
     def _detect_transformers(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """SegFormer transformers detection"""
+        """SegFormer transformers detection with L4 optimizations"""
         original_size = frame.shape[:2]
         
+        # L4 OPTIMIZATION: Resize to optimal resolution
+        if self.config.max_resolution and max(frame.shape[:2]) > self.config.max_resolution:
+            scale = self.config.max_resolution / max(frame.shape[:2])
+            new_size = (int(frame.shape[1] * scale), int(frame.shape[0] * scale))
+            frame_resized = cv2.resize(frame, new_size)
+        else:
+            frame_resized = frame
+        
         # Preprocess with transformers
-        inputs = self.processor(images=frame, return_tensors="pt")
+        inputs = self.processor(images=frame_resized, return_tensors="pt")
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         
-        # Get model output
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-            logits = outputs.logits
+        # L4 OPTIMIZATION: Convert to FP16 if enabled
+        if self.config.use_fp16 and self.device.type == 'cuda':
+            inputs = {k: v.half() if v.dtype == torch.float32 else v for k, v in inputs.items()}
+        
+        # Get model output with mixed precision
+        if self.config.use_fp16 and self.device.type == 'cuda':
+            with torch.no_grad(), torch.amp.autocast('cuda'):
+                outputs = self.model(**inputs)
+                logits = outputs.logits
+        else:
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+                logits = outputs.logits
         
         # Resize to original
         logits = F.interpolate(logits, size=original_size, mode='bilinear', align_corners=False)
         
-        # Get road probability
-        probs = F.softmax(logits, dim=1)
-        road_prob = probs[0, 0].cpu().numpy()
-        confidence_map = road_prob.copy()
+        # Multi-scale processing for better quality (if enabled)
+        if self.config.multi_scale and len(self.config.scales) > 1:
+            all_probs = []
+            base_probs = F.softmax(logits, dim=1)[0, 0].cpu().numpy()
+            all_probs.append(base_probs)
+            
+            # Process additional scales
+            for scale in self.config.scales:
+                if scale != 1.0:  # Skip the base scale we already processed
+                    # Resize frame for this scale
+                    if scale != 1.0:
+                        scale_size = (int(frame_resized.shape[1] * scale), int(frame_resized.shape[0] * scale))
+                        frame_scaled = cv2.resize(frame_resized, scale_size)
+                    else:
+                        frame_scaled = frame_resized
+                    
+                    # Process scaled frame
+                    scale_inputs = self.processor(images=frame_scaled, return_tensors="pt")
+                    scale_inputs = {k: v.to(self.device) for k, v in scale_inputs.items()}
+                    
+                    if self.config.use_fp16 and self.device.type == 'cuda':
+                        scale_inputs = {k: v.half() if v.dtype == torch.float32 else v for k, v in scale_inputs.items()}
+                    
+                    # Get output for this scale
+                    if self.config.use_fp16 and self.device.type == 'cuda':
+                        with torch.no_grad(), torch.amp.autocast('cuda'):
+                            scale_outputs = self.model(**scale_inputs)
+                            scale_logits = scale_outputs.logits
+                    else:
+                        with torch.no_grad():
+                            scale_outputs = self.model(**scale_inputs)
+                            scale_logits = scale_outputs.logits
+                    
+                    # Resize to original
+                    scale_logits = F.interpolate(scale_logits, size=original_size, mode='bilinear', align_corners=False)
+                    scale_probs = F.softmax(scale_logits, dim=1)[0, 0].cpu().numpy()
+                    all_probs.append(scale_probs)
+            
+            # Average all scales
+            road_prob = np.mean(all_probs, axis=0)
+            confidence_map = np.std(all_probs, axis=0)  # Use std as confidence measure
+        else:
+            # Single scale processing
+            probs = F.softmax(logits, dim=1)
+            road_prob = probs[0, 0].cpu().numpy()
+            confidence_map = road_prob.copy()
         
         # Create mask
         road_mask = (road_prob > self.config.conf_threshold).astype(np.uint8) * 255

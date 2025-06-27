@@ -413,28 +413,73 @@ class RoadDetectionConfig:
     multi_class_awareness: bool = False     # Use other classes to constrain roads
     bilateral_filter: bool = False          # Edge-preserving smoothing
     
+    # NEW: Fast video processing options
+    max_resolution: int = 1024  # Resize large images for speed
+    fast_processing: bool = True  # Enable fast video mode
+    
     def __post_init__(self):
         if self.scales is None:
             self.scales = [1.0]
 
-def create_improved_accurate_config():
-    """Create an improved 'accurate' configuration with person safety"""
+def create_fast_video_config():
+    """Create a fast configuration optimized for video processing"""
     return RoadDetectionConfig(
         model_type="transformers",
-        conf_threshold=0.5,
+        
+        # Fast video processing settings
+        conf_threshold=0.4,  # Still capture good road areas
+        
+        temporal_smooth=True,  # Keep this, it's fast
+        edge_refinement=True,  # Basic cleanup
+        
+        # DISABLE expensive processing for speed
+        advanced_edge_refinement=False,  # This is the bottleneck!
+        multi_class_awareness=False,    # Skip expensive person detection
+        geometric_filtering=False,      # Skip geometric analysis
+        bilateral_filter=False,         # Skip bilateral filtering
+        perspective_correction=False,
+        
+        multi_scale=False,
+        scales=[1.0],
+        debug_mode=False,  # No verbose logging
+        
+        # NEW: Fast video processing options
+        max_resolution=1024,  # Resize large images for speed
+        fast_processing=True  # Enable fast video mode
+    )
+
+def create_improved_accurate_config():
+    """Create the unified accurate configuration - trust the model's semantic understanding"""
+    return RoadDetectionConfig(
+        model_type="transformers",       # SegFormer-B5 - trained on Cityscapes, knows road vs non-road
+        conf_threshold=0.5,             # Trust the model - reasonable threshold
         temporal_smooth=True,
         edge_refinement=True,
-        advanced_edge_refinement=True,
-        confidence_edge_threshold=0.6,
-        
-        # CRITICAL: Must be True for person exclusion
-        multi_class_awareness=True,  # THIS MUST BE TRUE!
-        
-        geometric_filtering=True,
-        bilateral_filter=True,
+        advanced_edge_refinement=False,  # Let the model do its job
+        confidence_edge_threshold=0.6,   # Reasonable edge confidence
+        multi_class_awareness=True,      # Use semantic classes properly (not for aggressive filtering)
+        geometric_filtering=False,       # Trust the model's spatial understanding
+        bilateral_filter=False,          # Trust the model's edge detection
+        perspective_correction=False,    # Trust the model's perspective understanding
+        multi_scale=True,               # Keep multi-scale for robustness
+        scales=[0.75, 1.0, 1.25]       # Multi-scale helps with different road sizes
+    )
+
+def create_github_exact_accurate_config():
+    """Create the EXACT GitHub 'accurate' configuration (very aggressive, precision-focused)"""
+    return RoadDetectionConfig(
+        model_type="transformers",  # SegFormer-B5 for best accuracy
+        conf_threshold=0.77,        # GitHub exact: very high precision
+        temporal_smooth=True,
+        edge_refinement=True,
+        advanced_edge_refinement=True,  # Enhanced edge refinement
+        confidence_edge_threshold=0.85,  # GitHub exact: very strict edges
+        multi_class_awareness=True,      # Use other classes to constrain roads + person safety
+        geometric_filtering=True,        # Geometric constraints
+        bilateral_filter=True,           # Edge-preserving smoothing
         perspective_correction=True,
-        multi_scale=False,
-        scales=[1.0]
+        multi_scale=True,
+        scales=[0.75, 1.0, 1.25]
     )
 
 def improve_road_coverage(road_mask, confidence_map, expand_ratio=1.2):
@@ -507,46 +552,50 @@ def improve_road_coverage(road_mask, confidence_map, expand_ratio=1.2):
 
 def apply_road_detection_fixes(detector, use_smart_hood=True):
     """
-    Apply all fixes to an existing detector
-    Use this in your pipeline without changing core code
+    Apply minimal safety enhancements to trust the model's semantic understanding.
+    SegFormer-B5 is trained on Cityscapes and knows road vs hood vs dashboard.
     
     Args:
         detector: The road detector instance
-        use_smart_hood: If True, use smart hood detection. If False, use simple ratio
+        use_smart_hood: If True, apply minimal safety hood detection only in extreme cases
     """
     
-    if use_smart_hood:
-        # Use smart hood detection
-        hood_detector = SmartHoodDetector()
-        detector = apply_smart_hood_exclusion(detector, hood_detector)
-        print("Applied smart hood detection")
-    else:
-        # Fallback to simple ratio-based exclusion
-        print("Warning: Using simple hood exclusion. Consider enabling smart hood detection.")
-        original_detect = detector.detect_road
-        
-        def detect_with_simple_hood_exclusion(frame):
-            road_mask, confidence_map = original_detect(frame)
-            h, w = road_mask.shape
-            hood_height = int(h * 0.15)
-            road_mask[-hood_height:, :] = 0
-            confidence_map[-hood_height:, :] = 0
-            return road_mask, confidence_map
-        
-        detector.detect_road = detect_with_simple_hood_exclusion
+    # FIXED: Don't apply hood detection here, we'll do it after coverage improvement
+    # Store the original detect method
+    original_detect = detector.detect_road
     
-    # Add coverage improvement on top of hood exclusion
-    current_detect = detector.detect_road
-    
-    def enhanced_detect(frame):
-        road_mask, confidence_map = current_detect(frame)
+    def enhanced_detect_with_hood_respect(frame):
+        # Get the model's detection - trust the semantic segmentation
+        road_mask, confidence_map = original_detect(frame)
         
-        # Improve coverage
+        # Only apply minimal coverage improvement if needed
         road_mask = improve_road_coverage(road_mask, confidence_map)
+        
+        # TRUST THE MODEL - it knows what's road vs hood vs dashboard
+        # Only apply minimal safety hood detection in extreme cases
+        if use_smart_hood:
+            hood_detector = SmartHoodDetector()
+            hood_result = hood_detector.detect_hood(frame)
+            detector._last_hood_result = hood_result
+            
+            # Only exclude hood if it's VERY obvious and the model missed it
+            h, w = road_mask.shape
+            smart_hood_percentage = np.sum(hood_result.hood_mask > 0) / (h * w)
+            
+            # Only intervene if hood detection is very confident AND significant
+            if smart_hood_percentage > 0.15 and hood_result.confidence > 0.8:
+                print(f"  High-confidence hood detected ({smart_hood_percentage:.1%}), applying minimal exclusion")
+                road_mask[hood_result.hood_mask > 0] = 0
+                confidence_map[hood_result.hood_mask > 0] = 0
+            else:
+                print(f"  Trusting model's semantic understanding (hood: {smart_hood_percentage:.1%})")
         
         return road_mask, confidence_map
     
-    detector.detect_road = enhanced_detect
+    # Replace the detector's method completely
+    detector.detect_road = enhanced_detect_with_hood_respect
+    
+    print(f"Applied enhancements: minimal coverage improvement + trust model's semantic understanding")
     
     # Add enhanced visualization if using smart hood
     if use_smart_hood:
@@ -702,20 +751,41 @@ class ModernRoadDetector:
     
     def _advanced_edge_refinement(self, frame: np.ndarray, road_mask: np.ndarray, 
                                 confidence_map: np.ndarray, all_probs: torch.Tensor) -> np.ndarray:
-        """Advanced edge refinement to prevent bleeding onto walls/sidewalks"""
+        """
+        FIXED: Advanced edge refinement that doesn't remove all road pixels
+        """
         refined_mask = road_mask.copy()
+        
+        # FIXED: Safety check - if mask is already small, skip aggressive refinement
+        road_pixels = np.sum(road_mask > 0)
+        total_pixels = road_mask.shape[0] * road_mask.shape[1]
+        road_coverage = road_pixels / total_pixels
+        
+        if road_coverage < 0.05:  # Less than 5% coverage
+            print(f"  Skipping aggressive refinement (coverage: {road_coverage:.1%})")
+            return road_mask
+        
+        print(f"  Starting refinement with {road_pixels} road pixels ({road_coverage:.1%} coverage)")
         
         # 1. Confidence-based edge refinement
         if self.config.confidence_edge_threshold > self.config.conf_threshold:
             refined_mask = self._confidence_edge_refinement(refined_mask, confidence_map)
+            remaining_after_confidence = np.sum(refined_mask > 0)
+            print(f"  After confidence refinement: {remaining_after_confidence} pixels")
         
-        # 2. Multi-class awareness (prevent bleeding onto sidewalks/buildings)
+        # 2. FIXED: Multi-class awareness with safety checks
         if self.config.multi_class_awareness:
+            before_multiclass = np.sum(refined_mask > 0)
             refined_mask = self._multiclass_edge_refinement(refined_mask, all_probs)
+            after_multiclass = np.sum(refined_mask > 0)
+            print(f"  After multiclass refinement: {after_multiclass} pixels (removed {before_multiclass - after_multiclass})")
         
-        # 3. Geometric filtering (roads are typically horizontal)
+        # 3. Geometric filtering (keep this, it's usually helpful)
         if self.config.geometric_filtering:
+            before_geometric = np.sum(refined_mask > 0)
             refined_mask = self._geometric_edge_filtering(refined_mask, frame)
+            after_geometric = np.sum(refined_mask > 0)
+            print(f"  After geometric filtering: {after_geometric} pixels")
         
         # 4. Edge-preserving bilateral filtering
         if self.config.bilateral_filter:
@@ -723,6 +793,9 @@ class ModernRoadDetector:
         
         # 5. Clean up small components
         refined_mask = self._clean_small_components(refined_mask)
+        
+        final_pixels = np.sum(refined_mask > 0)
+        print(f"  Final refined mask: {final_pixels} pixels")
         
         return refined_mask
     
@@ -746,34 +819,45 @@ class ModernRoadDetector:
         return refined_mask
     
     def _multiclass_edge_refinement(self, road_mask: np.ndarray, all_probs: torch.Tensor) -> np.ndarray:
-        """Enhanced multi-class refinement with aggressive person exclusion"""
+        """
+        FIXED: Enhanced multi-class refinement with proper person exclusion
+        The original version was too aggressive and removed all road pixels
+        """
         # Get all class probabilities
         probs_np = all_probs[0].cpu().numpy()  # Shape: [num_classes, H, W]
         
-        # Classes that should NOT be road (with thresholds)
+        # FIXED: Much more conservative thresholds
         non_road_classes = {
-            # Static infrastructure
-            1: 0.6,   # sidewalk
-            2: 0.6,   # building
-            3: 0.6,   # wall
-            4: 0.6,   # fence
-            8: 0.5,   # vegetation
-            9: 0.5,   # terrain
-            10: 0.7,  # sky
+            # Static infrastructure - higher thresholds
+            1: 0.8,   # sidewalk - was 0.6, now 0.8
+            2: 0.8,   # building - was 0.6, now 0.8
+            3: 0.8,   # wall - was 0.6, now 0.8
+            4: 0.8,   # fence - was 0.6, now 0.8
+            8: 0.7,   # vegetation - was 0.5, now 0.7
+            9: 0.7,   # terrain - was 0.5, now 0.7
+            10: 0.9,  # sky - was 0.7, now 0.9
             
-            # CRITICAL: People and vehicles - VERY low thresholds
-            11: 0.15,  # person - EXTREMELY low threshold
-            12: 0.15,  # rider - EXTREMELY low threshold
-            13: 0.3,   # car
-            14: 0.3,   # truck
-            15: 0.3,   # bus
-            16: 0.3,   # train
-            17: 0.2,   # motorcycle
-            18: 0.2    # bicycle
+            # FIXED: People and vehicles - still low but not extreme
+            11: 0.3,  # person - was 0.15, now 0.3
+            12: 0.3,  # rider - was 0.15, now 0.3
+            13: 0.5,  # car - was 0.3, now 0.5
+            14: 0.5,  # truck - was 0.3, now 0.5
+            15: 0.5,  # bus - was 0.3, now 0.5
+            16: 0.5,  # train - was 0.3, now 0.5
+            17: 0.4,  # motorcycle - was 0.2, now 0.4
+            18: 0.4   # bicycle - was 0.2, now 0.4
         }
         
         # Create mask of areas strongly predicted as non-road
         non_road_mask = np.zeros(road_mask.shape[:2], dtype=bool)
+        
+        # FIXED: Only process if we have enough classes
+        if probs_np.shape[0] <= 1:
+            print("  Warning: Not enough classes for multiclass refinement")
+            return road_mask
+        
+        # FIXED: Track what we're removing for debugging
+        removal_stats = {}
         
         for cls, threshold in non_road_classes.items():
             if cls < probs_np.shape[0]:
@@ -781,28 +865,54 @@ class ModernRoadDetector:
                 
                 # Special handling for person class
                 if cls == 11:  # person
-                    # Even more aggressive exclusion for people
                     person_mask = class_prob > threshold
                     
-                    # IMPORTANT: Dilate person detections significantly
-                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
-                    person_mask_dilated = cv2.dilate(person_mask.astype(np.uint8), kernel, iterations=2)
-                    
-                    # Also check for vertical blob-like structures (people standing)
-                    person_mask_dilated = self._detect_vertical_blobs(person_mask_dilated, class_prob)
-                    
-                    non_road_mask |= person_mask_dilated.astype(bool)
-                    
-                    # Debug: Print if people detected
+                    # FIXED: Much less aggressive dilation
                     if np.any(person_mask):
+                        # Smaller dilation kernel
+                        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))  # was (25, 25)
+                        person_mask_dilated = cv2.dilate(person_mask.astype(np.uint8), kernel, iterations=1)  # was 2
+                        
+                        # FIXED: Remove the aggressive vertical blob detection
+                        # person_mask_dilated = self._detect_vertical_blobs(person_mask_dilated, class_prob)
+                        
+                        non_road_mask |= person_mask_dilated.astype(bool)
+                        
+                        # Debug info
                         person_pixels = np.sum(person_mask)
-                        print(f"  Person detected: {person_pixels} pixels (threshold: {threshold})")
+                        removal_stats[f'person_{cls}'] = person_pixels
+                        if person_pixels > 0:
+                            print(f"  Person detected: {person_pixels} pixels (threshold: {threshold})")
                 else:
-                    non_road_mask |= class_prob > threshold
+                    class_mask = class_prob > threshold
+                    if np.any(class_mask):
+                        non_road_mask |= class_mask
+                        removal_stats[f'class_{cls}'] = np.sum(class_mask)
         
-        # Additional safety: Detect potential people by shape/pattern
-        potential_people = self._detect_potential_people_by_pattern(road_mask.shape, all_probs)
-        non_road_mask |= potential_people
+        # FIXED: Remove the overly aggressive pattern detection
+        # potential_people = self._detect_potential_people_by_pattern(road_mask.shape, all_probs)
+        # non_road_mask |= potential_people
+        
+        # FIXED: Safety check - don't remove more than 50% of road pixels
+        road_pixels_original = np.sum(road_mask > 0)
+        pixels_to_remove = np.sum(non_road_mask & (road_mask > 0))
+        removal_ratio = pixels_to_remove / road_pixels_original if road_pixels_original > 0 else 0
+        
+        if removal_ratio > 0.5:  # If we're removing more than 50% of road
+            print(f"  WARNING: Would remove {removal_ratio:.1%} of road pixels - limiting removal")
+            
+            # FIXED: Only remove the highest confidence non-road areas
+            # Create a more conservative mask
+            conservative_non_road_mask = np.zeros_like(non_road_mask)
+            
+            for cls, threshold in non_road_classes.items():
+                if cls < probs_np.shape[0]:
+                    # Use much higher threshold for conservative removal
+                    conservative_threshold = min(0.9, threshold + 0.3)
+                    class_prob = probs_np[cls]
+                    conservative_non_road_mask |= class_prob > conservative_threshold
+            
+            non_road_mask = conservative_non_road_mask
         
         # Remove road pixels that are in non-road areas
         refined_mask = road_mask.copy()
@@ -811,8 +921,16 @@ class ModernRoadDetector:
         removed_pixels = np.sum(refined_mask[non_road_mask] > 0)
         if removed_pixels > 0:
             print(f"  Removing {removed_pixels} road pixels due to non-road classes")
+            print(f"  Removal ratio: {removed_pixels/road_pixels_original:.1%}")
         
         refined_mask[non_road_mask] = 0
+        
+        # FIXED: Final safety check - if we removed too much, return original
+        remaining_pixels = np.sum(refined_mask > 0)
+        if remaining_pixels < road_pixels_original * 0.1:  # Less than 10% remaining
+            print(f"  ERROR: Too much road removed ({remaining_pixels} pixels remaining)")
+            print(f"  Returning original mask with {road_pixels_original} pixels")
+            return road_mask  # Return original mask
         
         return refined_mask
     

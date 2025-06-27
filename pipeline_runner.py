@@ -70,13 +70,38 @@ def process_single_video(video_path: str, config: RoadDetectionConfig, stages: l
         stage1_output = os.path.join(output_struct['stage1_dir'], 'road_detection.mp4')
         
         try:
-            # Use the modern detection function directly
-            from stage1_road_detection import ModernRoadDetector, RoadDetectionValidator
+            # Import the functions from stage1_road_detection directly
+            from stage1_road_detection import (
+                ModernRoadDetector, 
+                RoadDetectionValidator,
+                create_improved_accurate_config,
+                apply_road_detection_fixes
+            )
             import cv2
             import numpy as np
             
+            # ALWAYS use improved config for accurate mode (detected by transformers model type)
+            if config.model_type == "transformers":
+                improved_config = create_improved_accurate_config()
+                print("Using improved accurate config with person safety")
+                print(f"  - Multi-class awareness: {improved_config.multi_class_awareness}")
+                print(f"  - Conf threshold: {improved_config.conf_threshold}")
+            else:
+                improved_config = config
+            
             # Initialize detector
-            detector = ModernRoadDetector(config)
+            detector = ModernRoadDetector(improved_config)
+            
+            # Apply fixes with SMART hood detection (not simple ratio)
+            detector = apply_road_detection_fixes(detector, use_smart_hood=True)
+            print("Applied smart hood detection and coverage improvements")
+            
+            # CRITICAL: Verify multi-class awareness is enabled
+            if not detector.config.multi_class_awareness:
+                print("WARNING: Multi-class awareness is DISABLED - people may be detected as road!")
+                detector.config.multi_class_awareness = True
+                print("FIXED: Enabled multi-class awareness for safety")
+            
             validator = RoadDetectionValidator()
             
             # Open video
@@ -115,7 +140,7 @@ def process_single_video(video_path: str, config: RoadDetectionConfig, stages: l
                 if not ret:
                     break
                 
-                # Detect road
+                # Detect road with adaptive calibration
                 road_mask, confidence_map = detector.detect_road(frame)
                 
                 # Create metadata for compatibility
@@ -126,7 +151,11 @@ def process_single_video(video_path: str, config: RoadDetectionConfig, stages: l
                 metadata = {
                     'road_percentage': road_percentage,
                     'frame_shape': frame.shape[:2],
-                    'model_type': detector.model_type
+                    'model_type': detector.config.model_type,
+                    'hood_exclusion': True,
+                    'coverage_improved': True,
+                    'confidence_threshold': detector.config.conf_threshold,
+                    'frame_count': frame_count
                 }
                 
                 # Validate
@@ -192,13 +221,151 @@ def process_single_video(video_path: str, config: RoadDetectionConfig, stages: l
             traceback.print_exc()
             results['stage_outputs']['stage1'] = {'error': str(e)}
     
-    # Stage 2: Lane Detection (Coming Next)
+    # Stage 2: Lane Detection
     if 2 in stages:
-        print(f"\n🛣️  Stage 2: Lane Detection (Coming Soon)")
-        # TODO: Implement Stage 2
-        print("   - Will use road masks from Stage 1")
-        print("   - Detect lane lines within road areas")
-        print("   - Output lane coordinates and confidence")
+        print(f"\n🛣️  Stage 2: Advanced Lane Detection")
+        stage2_output = os.path.join(output_struct['stage2_dir'], 'lane_detection.mp4')
+        
+        try:
+            # Import improved lane detection
+            from lane_detection import AdvancedLaneDetector, LaneDetectionConfig, LaneModel
+            import cv2
+            
+            # Configure lane detection
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            
+            lane_config = LaneDetectionConfig(
+                model=LaneModel.ULTRA_FAST,
+                device=device,
+                confidence_threshold=0.5,
+                max_lanes=4,
+                use_fp16=True if device == "cuda" else False,
+                visualize=True
+            )
+            
+            # Initialize detector
+            lane_detector = AdvancedLaneDetector(lane_config)
+            
+            # Open input video (use original, not road detection output)
+            print(f"Processing lanes in: {video_path}")
+            cap = cv2.VideoCapture(video_path)
+            
+            fps = int(cap.get(cv2.CAP_PROP_FPS))
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            
+            print(f"Lane detection on {width}x{height}, {fps} fps, {total_frames} frames")
+            
+            # Output video
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(stage2_output, fourcc, fps, (width, height))
+            
+            # Process frames
+            frame_count = 0
+            processing_start_time = time.time()
+            all_lane_results = []
+            total_lanes_detected = 0
+            
+            print(f"Processing {total_frames} frames for lane detection...")
+            
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                # Detect lanes
+                result = lane_detector.detector.detect_lanes(frame)
+                lanes = result['lanes']
+                confidences = result['confidence']
+                
+                # Store results
+                frame_result = {
+                    'frame': frame_count + 1,
+                    'lanes': [lane.tolist() for lane in lanes],
+                    'confidence': confidences,
+                    'timestamp': frame_count / fps
+                }
+                all_lane_results.append(frame_result)
+                total_lanes_detected += len(lanes)
+                
+                # Visualize
+                if lane_config.visualize:
+                    vis_frame = lane_detector._visualize_lanes(frame, lanes, confidences)
+                    
+                    # Add info text
+                    info_text = f"Frame {frame_count+1}/{total_frames} | Lanes: {len(lanes)} | Model: {lane_config.model.value}"
+                    cv2.putText(vis_frame, info_text, (10, 30), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                    
+                    out.write(vis_frame)
+                else:
+                    out.write(frame)
+                
+                frame_count += 1
+                
+                # Progress update
+                if frame_count % 30 == 0:
+                    elapsed = time.time() - processing_start_time
+                    fps_actual = frame_count / elapsed
+                    eta = (total_frames - frame_count) / fps_actual if fps_actual > 0 else 0
+                    print(f"Lane Progress: {frame_count}/{total_frames} ({fps_actual:.1f} FPS, ETA: {eta:.0f}s)")
+            
+            cap.release()
+            out.release()
+            
+            total_time = time.time() - processing_start_time
+            avg_lanes = total_lanes_detected / frame_count if frame_count > 0 else 0
+            
+            # Save lane detection results
+            lane_results = {
+                'video_info': {
+                    'input_path': video_path,
+                    'output_path': stage2_output,
+                    'fps': fps,
+                    'width': width,
+                    'height': height,
+                    'total_frames': total_frames
+                },
+                'detection_info': {
+                    'model': lane_config.model.value,
+                    'device': lane_config.device,
+                    'processing_time': total_time,
+                    'fps_processed': frame_count / total_time,
+                    'total_lanes_detected': total_lanes_detected,
+                    'average_lanes_per_frame': avg_lanes,
+                    'confidence_threshold': lane_config.confidence_threshold
+                },
+                'frame_results': all_lane_results
+            }
+            
+            # Save JSON results
+            json_path = stage2_output.replace('.mp4', '_lanes.json')
+            with open(json_path, 'w') as f:
+                json.dump(lane_results, f, indent=2)
+            
+            results['stages_completed'].append(2)
+            results['stage_outputs']['stage2'] = {
+                'visualization': stage2_output,
+                'lane_data': json_path,
+                'stats': lane_results['detection_info']
+            }
+            
+            print(f"✓ Stage 2 completed successfully")
+            print(f"  - Processed {frame_count} frames in {total_time:.1f}s")
+            print(f"  - Average FPS: {frame_count/total_time:.1f}")
+            print(f"  - Total lanes detected: {total_lanes_detected}")
+            print(f"  - Average lanes per frame: {avg_lanes:.2f}")
+            print(f"  - Model: {lane_config.model.value}")
+            print(f"  - Output: {stage2_output}")
+            print(f"  - Lane data: {json_path}")
+            
+        except Exception as e:
+            print(f"❌ Stage 2 failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            results['stage_outputs']['stage2'] = {'error': str(e)}
     
     # Stage 3: Lane Classification (Coming Next)
     if 3 in stages:
@@ -243,8 +410,8 @@ def main():
                        help='Process all videos in input_videos folder')
     parser.add_argument('--list', action='store_true',
                        help='List available videos')
-    parser.add_argument('--stages', type=int, nargs='*', default=[1],
-                       help='Stages to run (1-5), default: [1]')
+    parser.add_argument('--stages', type=int, nargs='*', default=[1, 2],
+                       help='Stages to run (1-5), default: [1, 2]')
     parser.add_argument('--config', type=str, choices=['fast', 'balanced', 'accurate'], 
                        default='accurate', help='Processing configuration')
     

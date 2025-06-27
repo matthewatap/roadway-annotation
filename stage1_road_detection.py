@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Stage 1: Road Detection for Dashcam Annotation Pipeline
-Integrated with debug capabilities and fixed detection methods
+Integrated with debug capabilities, fixed detection methods, and smart hood detection
 """
 
 import cv2
@@ -14,6 +14,385 @@ from PIL import Image
 from dataclasses import dataclass
 from typing import Tuple, Optional, Dict, Any
 import os
+
+@dataclass
+class HoodDetectionResult:
+    """Results from hood detection"""
+    hood_mask: np.ndarray
+    hood_ratio: float
+    confidence: float
+    method_used: str
+    hood_polygon: Optional[np.ndarray] = None
+
+class SmartHoodDetector:
+    """Intelligent hood detection that adapts to different vehicles and camera positions"""
+    
+    def __init__(self):
+        self.calibration_frames = []
+        self.detected_hood_ratio = None
+        self.hood_template = None
+        self.is_calibrated = False
+        
+    def detect_hood(self, frame: np.ndarray, frame_number: int = 0) -> HoodDetectionResult:
+        """
+        Detect vehicle hood using multiple methods
+        Returns a mask where hood pixels are 255, rest are 0
+        """
+        h, w = frame.shape[:2]
+        
+        # Try multiple detection methods in order of reliability
+        methods = [
+            self._detect_hood_by_color_consistency,
+            self._detect_hood_by_edge_patterns,
+            self._detect_hood_by_geometry
+        ]
+        
+        best_result = None
+        best_confidence = 0
+        
+        for method in methods:
+            try:
+                result = method(frame)
+                if result and result.confidence > best_confidence:
+                    best_result = result
+                    best_confidence = result.confidence
+                    
+                # If we have high confidence, use it
+                if best_confidence > 0.8:
+                    break
+            except Exception as e:
+                continue
+        
+        # Fallback to calibrated value or conservative estimate
+        if best_result is None or best_confidence < 0.3:
+            best_result = self._fallback_hood_detection(frame)
+        
+        # Update calibration
+        if frame_number < 30 and best_confidence > 0.6:
+            self._update_calibration(best_result)
+        
+        return best_result
+    
+    def _detect_hood_by_color_consistency(self, frame: np.ndarray) -> Optional[HoodDetectionResult]:
+        """
+        Detect hood by looking for consistent dark region at bottom
+        Hoods are typically uniform in color and darker than road
+        """
+        h, w = frame.shape[:2]
+        
+        # Analyze bottom 40% of image
+        bottom_region = frame[int(h * 0.6):, :]
+        
+        # Convert to LAB for better color analysis
+        lab = cv2.cvtColor(bottom_region, cv2.COLOR_BGR2LAB)
+        l_channel = lab[:, :, 0]
+        
+        # Find dark, uniform regions
+        mask = np.zeros((bottom_region.shape[0], w), dtype=np.uint8)
+        
+        # Scan from bottom up
+        for y in range(bottom_region.shape[0] - 1, -1, -1):
+            row = l_channel[y, :]
+            
+            # Check if row is dark and uniform
+            mean_val = np.mean(row)
+            std_val = np.std(row)
+            
+            # Hood characteristics: dark (low L) and uniform (low std)
+            if mean_val < 50 and std_val < 15:
+                mask[y:, :] = 255
+            else:
+                # Check if we've found enough hood
+                if np.sum(mask) > 0:
+                    break
+        
+        # Validate the detected region
+        hood_pixels = np.sum(mask > 0)
+        total_pixels = mask.size
+        hood_ratio = hood_pixels / (h * w)
+        
+        if 0.05 < hood_ratio < 0.3:  # Reasonable hood size
+            # Create full image mask
+            full_mask = np.zeros((h, w), dtype=np.uint8)
+            full_mask[int(h * 0.6):, :] = mask
+            
+            # Refine edges
+            full_mask = self._refine_hood_edges(full_mask, frame)
+            
+            return HoodDetectionResult(
+                hood_mask=full_mask,
+                hood_ratio=hood_ratio,
+                confidence=0.7,
+                method_used="color_consistency"
+            )
+        
+        return None
+    
+    def _detect_hood_by_edge_patterns(self, frame: np.ndarray) -> Optional[HoodDetectionResult]:
+        """
+        Detect hood by characteristic edge patterns
+        Hood-windshield boundary often has strong horizontal edge
+        """
+        h, w = frame.shape[:2]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Detect edges
+        edges = cv2.Canny(gray, 50, 150)
+        
+        # Focus on bottom half
+        bottom_half = edges[h//2:, :]
+        
+        # Detect horizontal lines using Hough transform
+        lines = cv2.HoughLinesP(bottom_half, 1, np.pi/180, 100, 
+                               minLineLength=w//3, maxLineGap=50)
+        
+        if lines is not None:
+            # Find strong horizontal lines
+            horizontal_lines = []
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                angle = np.abs(np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi)
+                
+                # Nearly horizontal (within 10 degrees)
+                if angle < 10 or angle > 170:
+                    # Adjust y coordinates to full image
+                    y1 += h//2
+                    y2 += h//2
+                    horizontal_lines.append((y1 + y2) // 2)
+            
+            if horizontal_lines:
+                # Find the most prominent horizontal edge
+                horizontal_lines.sort()
+                
+                # Look for hood boundary (usually in bottom 30%)
+                for hood_y in horizontal_lines:
+                    if hood_y > h * 0.7:
+                        # Create hood mask
+                        hood_mask = np.zeros((h, w), dtype=np.uint8)
+                        hood_mask[hood_y:, :] = 255
+                        
+                        # Validate using color consistency
+                        hood_region = frame[hood_y:, :]
+                        mean_color = np.mean(hood_region.reshape(-1, 3), axis=0)
+                        color_std = np.std(hood_region.reshape(-1, 3))
+                        
+                        if color_std < 30:  # Uniform color
+                            hood_ratio = (h - hood_y) / h
+                            
+                            return HoodDetectionResult(
+                                hood_mask=hood_mask,
+                                hood_ratio=hood_ratio,
+                                confidence=0.8,
+                                method_used="edge_patterns"
+                            )
+        
+        return None
+    
+    def _detect_hood_by_geometry(self, frame: np.ndarray) -> Optional[HoodDetectionResult]:
+        """
+        Detect hood using geometric assumptions
+        Hood often appears as a dark trapezoid at bottom
+        """
+        h, w = frame.shape[:2]
+        
+        # Convert to grayscale
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Look for dark regions in bottom third
+        bottom_third = gray[2*h//3:, :]
+        
+        # Threshold to find dark areas
+        _, binary = cv2.threshold(bottom_third, 60, 255, cv2.THRESH_BINARY_INV)
+        
+        # Find contours
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if contours:
+            # Find largest contour
+            largest_contour = max(contours, key=cv2.contourArea)
+            area = cv2.contourArea(largest_contour)
+            
+            # Check if it's significant
+            if area > (w * h * 0.05):  # At least 5% of image
+                # Approximate to polygon
+                epsilon = 0.02 * cv2.arcLength(largest_contour, True)
+                approx = cv2.approxPolyDP(largest_contour, epsilon, True)
+                
+                # Check if it's roughly trapezoidal (4-6 vertices)
+                if 4 <= len(approx) <= 6:
+                    # Create mask
+                    mask = np.zeros((bottom_third.shape[0], w), dtype=np.uint8)
+                    cv2.drawContours(mask, [largest_contour], -1, 255, -1)
+                    
+                    # Full image mask
+                    full_mask = np.zeros((h, w), dtype=np.uint8)
+                    full_mask[2*h//3:, :] = mask
+                    
+                    hood_ratio = np.sum(full_mask > 0) / (h * w)
+                    
+                    # Adjust polygon coordinates to full image
+                    adjusted_polygon = approx.copy()
+                    adjusted_polygon[:, :, 1] += 2*h//3
+                    
+                    return HoodDetectionResult(
+                        hood_mask=full_mask,
+                        hood_ratio=hood_ratio,
+                        confidence=0.6,
+                        method_used="geometry",
+                        hood_polygon=adjusted_polygon
+                    )
+        
+        return None
+    
+    def _fallback_hood_detection(self, frame: np.ndarray) -> HoodDetectionResult:
+        """
+        Conservative fallback when other methods fail
+        Uses calibrated value or minimal exclusion
+        """
+        h, w = frame.shape[:2]
+        
+        # Use calibrated ratio if available
+        if self.detected_hood_ratio:
+            hood_height = int(h * self.detected_hood_ratio)
+        else:
+            # Conservative estimate - just exclude very bottom
+            hood_height = int(h * 0.08)
+        
+        hood_mask = np.zeros((h, w), dtype=np.uint8)
+        hood_mask[-hood_height:, :] = 255
+        
+        return HoodDetectionResult(
+            hood_mask=hood_mask,
+            hood_ratio=hood_height / h,
+            confidence=0.3,
+            method_used="fallback"
+        )
+    
+    def _refine_hood_edges(self, hood_mask: np.ndarray, frame: np.ndarray) -> np.ndarray:
+        """
+        Refine hood mask edges using image gradients
+        """
+        h, w = frame.shape[:2]
+        
+        # Find the top edge of current mask
+        hood_top = np.where(hood_mask > 0)[0].min() if np.any(hood_mask) else h
+        
+        # Look for strong gradients near the edge
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        
+        # Search region around current edge
+        search_start = max(0, hood_top - 30)
+        search_end = min(h, hood_top + 30)
+        
+        if search_start < search_end:
+            search_region = np.abs(grad_y[search_start:search_end, :])
+            
+            # Find strongest horizontal edge
+            edge_strength = np.mean(search_region, axis=1)
+            best_edge = np.argmax(edge_strength) + search_start
+            
+            # Update mask
+            refined_mask = np.zeros_like(hood_mask)
+            refined_mask[best_edge:, :] = 255
+            
+            # Smooth the edge
+            kernel = np.ones((5, w), np.float32) / (5 * w)
+            refined_mask = cv2.filter2D(refined_mask, -1, kernel)
+            refined_mask = (refined_mask > 127).astype(np.uint8) * 255
+            
+            return refined_mask
+        
+        return hood_mask
+    
+    def _update_calibration(self, result: HoodDetectionResult):
+        """Update calibration with high-confidence detections"""
+        if result.confidence > 0.6:
+            if self.detected_hood_ratio is None:
+                self.detected_hood_ratio = result.hood_ratio
+            else:
+                # Moving average
+                self.detected_hood_ratio = 0.9 * self.detected_hood_ratio + 0.1 * result.hood_ratio
+            
+            if len(self.calibration_frames) >= 10:
+                self.is_calibrated = True
+
+def apply_smart_hood_exclusion(detector, hood_detector: Optional[SmartHoodDetector] = None):
+    """
+    Apply smart hood exclusion to any road detector
+    """
+    if hood_detector is None:
+        hood_detector = SmartHoodDetector()
+    
+    original_detect = detector.detect_road
+    frame_count = 0
+    
+    def detect_with_smart_hood_exclusion(frame):
+        nonlocal frame_count
+        
+        # Detect hood
+        hood_result = hood_detector.detect_hood(frame, frame_count)
+        frame_count += 1
+        
+        # Get road detection
+        road_mask, confidence_map = original_detect(frame)
+        
+        # Apply hood mask (inverse - where hood is NOT)
+        hood_exclusion_mask = cv2.bitwise_not(hood_result.hood_mask)
+        road_mask = cv2.bitwise_and(road_mask, hood_exclusion_mask)
+        
+        # Also zero out confidence in hood area
+        confidence_map = confidence_map * (hood_exclusion_mask / 255.0)
+        
+        # Store hood info for visualization
+        detector._last_hood_result = hood_result
+        
+        return road_mask, confidence_map
+    
+    detector.detect_road = detect_with_smart_hood_exclusion
+    return detector
+
+def visualize_with_hood_detection(frame: np.ndarray, road_mask: np.ndarray, 
+                                 hood_result: HoodDetectionResult) -> np.ndarray:
+    """
+    Visualize both road and hood detection
+    """
+    vis = frame.copy()
+    h, w = frame.shape[:2]
+    
+    # Show road in blue
+    road_overlay = np.zeros_like(vis)
+    road_overlay[road_mask > 0] = [255, 100, 0]  # Orange-blue
+    vis = cv2.addWeighted(vis, 0.7, road_overlay, 0.3, 0)
+    
+    # Show hood boundary
+    hood_edge = cv2.Canny(hood_result.hood_mask, 50, 150)
+    vis[hood_edge > 0] = [0, 0, 255]  # Red edge
+    
+    # If we have hood polygon, draw it
+    if hood_result.hood_polygon is not None:
+        cv2.drawContours(vis, [hood_result.hood_polygon], -1, (0, 255, 255), 2)
+    
+    # Add text info
+    info_y = 30
+    cv2.putText(vis, f"Hood Detection: {hood_result.method_used}", (10, info_y),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    info_y += 30
+    cv2.putText(vis, f"Hood Coverage: {hood_result.hood_ratio:.1%}", (10, info_y),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    info_y += 30
+    cv2.putText(vis, f"Confidence: {hood_result.confidence:.2f}", (10, info_y),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    
+    # Show road coverage (excluding hood area)
+    road_pixels = np.sum(road_mask > 0)
+    non_hood_pixels = np.sum(hood_result.hood_mask == 0)
+    road_coverage = road_pixels / non_hood_pixels * 100 if non_hood_pixels > 0 else 0
+    info_y += 30
+    cv2.putText(vis, f"Road Coverage: {road_coverage:.1f}%", (10, info_y),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    
+    return vis
 
 @dataclass
 class RoadDetectionConfig:
@@ -37,6 +416,164 @@ class RoadDetectionConfig:
     def __post_init__(self):
         if self.scales is None:
             self.scales = [1.0]
+
+def create_improved_accurate_config():
+    """Create an improved 'accurate' configuration with person safety"""
+    return RoadDetectionConfig(
+        model_type="transformers",
+        conf_threshold=0.5,
+        temporal_smooth=True,
+        edge_refinement=True,
+        advanced_edge_refinement=True,
+        confidence_edge_threshold=0.6,
+        
+        # CRITICAL: Must be True for person exclusion
+        multi_class_awareness=True,  # THIS MUST BE TRUE!
+        
+        geometric_filtering=True,
+        bilateral_filter=True,
+        perspective_correction=True,
+        multi_scale=False,
+        scales=[1.0]
+    )
+
+def improve_road_coverage(road_mask, confidence_map, expand_ratio=1.2):
+    """
+    Post-process to improve road coverage with adaptive dilation
+    Can be applied after detection
+    """
+    h, w = road_mask.shape
+    
+    # 1. Adaptive dilation based on distance from camera
+    # More expansion for distant road (top of image)
+    expanded = road_mask.copy()
+    
+    for y in range(0, h, 10):
+        # Calculate expansion factor based on position
+        # More expansion at top (distant road), less at bottom
+        position_factor = 1.0 - (y / h) * 0.5  # 1.0 at top, 0.5 at bottom
+        local_kernel_size = int(7 * expand_ratio * position_factor)
+        
+        if local_kernel_size > 1:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, 
+                                              (local_kernel_size, local_kernel_size))
+            
+            # Process a strip of the image
+            strip_start = y
+            strip_end = min(y + 10, h)
+            
+            strip = road_mask[strip_start:strip_end, :]
+            strip_expanded = cv2.dilate(strip, kernel, iterations=1)
+            expanded[strip_start:strip_end, :] = strip_expanded
+    
+    # 2. Only keep expanded areas with reasonable confidence
+    conf_threshold = 0.3  # Lower threshold for expanded areas
+    valid_expansion = (confidence_map > conf_threshold).astype(np.uint8) * 255
+    expanded = cv2.bitwise_and(expanded, valid_expansion)
+    
+    # 3. Combine with original
+    improved = cv2.bitwise_or(road_mask, expanded)
+    
+    # 4. Fill gaps horizontally (roads are continuous)
+    for y in range(int(h * 0.3), int(h * 0.9)):
+        row = improved[y, :]
+        
+        # Find road segments
+        changes = np.diff(np.concatenate([[0], row, [0]]))
+        starts = np.where(changes > 0)[0]
+        ends = np.where(changes < 0)[0]
+        
+        # Ensure starts and ends are properly paired
+        if len(starts) >= 2 and len(ends) >= len(starts):
+            # Fill small gaps between segments
+            for i in range(len(starts) - 1):
+                if i < len(ends):  # Safety check
+                    gap_start = ends[i]
+                    gap_end = starts[i + 1]
+                    gap_size = gap_end - gap_start
+                    
+                    # Fill if gap is small relative to image width
+                    if gap_size < w * 0.15:  # Max 15% of width
+                        improved[y, gap_start:gap_end] = 255
+    
+    # 5. Morphological closing
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    improved = cv2.morphologyEx(improved, cv2.MORPH_CLOSE, kernel_close)
+    
+    # 6. Smooth boundaries
+    improved = cv2.medianBlur(improved, 5)
+    
+    return improved
+
+def apply_road_detection_fixes(detector, use_smart_hood=True):
+    """
+    Apply all fixes to an existing detector
+    Use this in your pipeline without changing core code
+    
+    Args:
+        detector: The road detector instance
+        use_smart_hood: If True, use smart hood detection. If False, use simple ratio
+    """
+    
+    if use_smart_hood:
+        # Use smart hood detection
+        hood_detector = SmartHoodDetector()
+        detector = apply_smart_hood_exclusion(detector, hood_detector)
+        print("Applied smart hood detection")
+    else:
+        # Fallback to simple ratio-based exclusion
+        print("Warning: Using simple hood exclusion. Consider enabling smart hood detection.")
+        original_detect = detector.detect_road
+        
+        def detect_with_simple_hood_exclusion(frame):
+            road_mask, confidence_map = original_detect(frame)
+            h, w = road_mask.shape
+            hood_height = int(h * 0.15)
+            road_mask[-hood_height:, :] = 0
+            confidence_map[-hood_height:, :] = 0
+            return road_mask, confidence_map
+        
+        detector.detect_road = detect_with_simple_hood_exclusion
+    
+    # Add coverage improvement on top of hood exclusion
+    current_detect = detector.detect_road
+    
+    def enhanced_detect(frame):
+        road_mask, confidence_map = current_detect(frame)
+        
+        # Improve coverage
+        road_mask = improve_road_coverage(road_mask, confidence_map)
+        
+        return road_mask, confidence_map
+    
+    detector.detect_road = enhanced_detect
+    
+    # Add enhanced visualization if using smart hood
+    if use_smart_hood:
+        original_visualize = detector.visualize
+        
+        def enhanced_visualize(frame, road_mask, style="freespace"):
+            # Get base visualization
+            vis = original_visualize(frame, road_mask, style)
+            
+            # Add hood detection info if available
+            if hasattr(detector, '_last_hood_result'):
+                hood_result = detector._last_hood_result
+                
+                # Draw hood boundary in red
+                hood_edge = cv2.Canny(hood_result.hood_mask, 50, 150)
+                vis[hood_edge > 0] = [0, 0, 255]
+                
+                # Add hood detection info
+                info_text = f"Hood: {hood_result.method_used} ({hood_result.confidence:.2f})"
+                cv2.putText(vis, info_text, (10, vis.shape[0] - 10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            
+            return vis
+        
+        detector.visualize = enhanced_visualize
+    
+    return detector
 
 class ModernRoadDetector:
     """Modern road detector with multiple backends"""
@@ -209,25 +746,151 @@ class ModernRoadDetector:
         return refined_mask
     
     def _multiclass_edge_refinement(self, road_mask: np.ndarray, all_probs: torch.Tensor) -> np.ndarray:
-        """Use other class predictions to constrain road boundaries"""
+        """Enhanced multi-class refinement with aggressive person exclusion"""
         # Get all class probabilities
         probs_np = all_probs[0].cpu().numpy()  # Shape: [num_classes, H, W]
         
-        # Classes that should NOT be road (sidewalk=1, building=2, wall=3, fence=4)
-        non_road_classes = [1, 2, 3, 4, 8]  # sidewalk, building, wall, fence, vegetation
+        # Classes that should NOT be road (with thresholds)
+        non_road_classes = {
+            # Static infrastructure
+            1: 0.6,   # sidewalk
+            2: 0.6,   # building
+            3: 0.6,   # wall
+            4: 0.6,   # fence
+            8: 0.5,   # vegetation
+            9: 0.5,   # terrain
+            10: 0.7,  # sky
+            
+            # CRITICAL: People and vehicles - VERY low thresholds
+            11: 0.15,  # person - EXTREMELY low threshold
+            12: 0.15,  # rider - EXTREMELY low threshold
+            13: 0.3,   # car
+            14: 0.3,   # truck
+            15: 0.3,   # bus
+            16: 0.3,   # train
+            17: 0.2,   # motorcycle
+            18: 0.2    # bicycle
+        }
         
         # Create mask of areas strongly predicted as non-road
         non_road_mask = np.zeros(road_mask.shape[:2], dtype=bool)
-        for cls in non_road_classes:
-            if cls < probs_np.shape[0]:
-                # Areas with >60% confidence of being this non-road class
-                non_road_mask |= probs_np[cls] > 0.6
         
-        # Remove road pixels that are strongly predicted as non-road
+        for cls, threshold in non_road_classes.items():
+            if cls < probs_np.shape[0]:
+                class_prob = probs_np[cls]
+                
+                # Special handling for person class
+                if cls == 11:  # person
+                    # Even more aggressive exclusion for people
+                    person_mask = class_prob > threshold
+                    
+                    # IMPORTANT: Dilate person detections significantly
+                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
+                    person_mask_dilated = cv2.dilate(person_mask.astype(np.uint8), kernel, iterations=2)
+                    
+                    # Also check for vertical blob-like structures (people standing)
+                    person_mask_dilated = self._detect_vertical_blobs(person_mask_dilated, class_prob)
+                    
+                    non_road_mask |= person_mask_dilated.astype(bool)
+                    
+                    # Debug: Print if people detected
+                    if np.any(person_mask):
+                        person_pixels = np.sum(person_mask)
+                        print(f"  Person detected: {person_pixels} pixels (threshold: {threshold})")
+                else:
+                    non_road_mask |= class_prob > threshold
+        
+        # Additional safety: Detect potential people by shape/pattern
+        potential_people = self._detect_potential_people_by_pattern(road_mask.shape, all_probs)
+        non_road_mask |= potential_people
+        
+        # Remove road pixels that are in non-road areas
         refined_mask = road_mask.copy()
+        
+        # Count how many road pixels we're removing
+        removed_pixels = np.sum(refined_mask[non_road_mask] > 0)
+        if removed_pixels > 0:
+            print(f"  Removing {removed_pixels} road pixels due to non-road classes")
+        
         refined_mask[non_road_mask] = 0
         
         return refined_mask
+    
+    def _detect_vertical_blobs(self, person_mask: np.ndarray, person_prob: np.ndarray) -> np.ndarray:
+        """Detect vertical blob-like structures that might be people"""
+        h, w = person_mask.shape
+        enhanced_mask = person_mask.copy()
+        
+        # Look for vertical continuous regions (people are typically vertical)
+        for x in range(w):
+            column = person_prob[:, x]
+            
+            # Find continuous high-probability regions
+            high_prob_regions = []
+            in_region = False
+            start_y = 0
+            
+            for y in range(h):
+                if column[y] > 0.1:  # Very low threshold
+                    if not in_region:
+                        in_region = True
+                        start_y = y
+                else:
+                    if in_region:
+                        # Check if region is tall enough to be a person
+                        if y - start_y > h * 0.05:  # At least 5% of image height
+                            high_prob_regions.append((start_y, y))
+                        in_region = False
+            
+            # Mark vertical regions as potential people
+            for start_y, end_y in high_prob_regions:
+                # Check aspect ratio (people are tall and narrow)
+                region_height = end_y - start_y
+                if region_height > h * 0.05:  # Reasonable height
+                    # Expand horizontally around this column
+                    x_start = max(0, x - 10)
+                    x_end = min(w, x + 10)
+                    enhanced_mask[start_y:end_y, x_start:x_end] = 1
+        
+        return enhanced_mask
+    
+    def _detect_potential_people_by_pattern(self, shape: Tuple[int, int], all_probs: torch.Tensor) -> np.ndarray:
+        """Detect potential people using pattern analysis"""
+        h, w = shape
+        potential_people = np.zeros((h, w), dtype=bool)
+        
+        # Get probabilities for relevant classes
+        probs_np = all_probs[0].cpu().numpy()
+        
+        # Look for areas that are:
+        # 1. Not strongly any other class
+        # 2. In expected pedestrian zones
+        # 3. Have certain shape characteristics
+        
+        # Calculate "unknown" areas (low confidence for all classes)
+        max_class_prob = np.max(probs_np, axis=0)
+        uncertain_areas = max_class_prob < 0.5
+        
+        # Focus on lower part of image where people typically appear
+        pedestrian_zone = np.zeros((h, w), dtype=bool)
+        pedestrian_zone[int(h * 0.3):, :] = True  # Bottom 70% of image
+        
+        # Combine: uncertain areas in pedestrian zones might be people
+        potential_people = uncertain_areas & pedestrian_zone
+        
+        # Also check for vertical edge patterns (people have strong vertical edges)
+        gray_prob = np.mean(probs_np[:3], axis=0)  # Average of first few classes
+        edges_y = cv2.Sobel(gray_prob, cv2.CV_64F, 0, 1, ksize=3)
+        vertical_edges = np.abs(edges_y) > 0.1
+        
+        # Vertical edges in pedestrian zones
+        potential_people |= (vertical_edges & pedestrian_zone)
+        
+        # Dilate to be safe
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        potential_people = cv2.dilate(potential_people.astype(np.uint8), kernel, iterations=1).astype(bool)
+        
+        return potential_people
     
     def _geometric_edge_filtering(self, road_mask: np.ndarray, frame: np.ndarray) -> np.ndarray:
         """Filter edges based on road geometry (roads are typically horizontal)"""
@@ -248,9 +911,15 @@ class ModernRoadDetector:
             if M["m00"] != 0:
                 cy = int(M["m01"] / M["m00"])
                 
-                # Check if contour is in reasonable road position (not too high)
-                if cy > h * 0.3:  # Road shouldn't be in top 30% of image
-                    cv2.drawContours(refined_mask, [contour], -1, 255, -1)
+                # Check if contour is in reasonable road position and has proper shape
+                if cy > h * 0.25:  # Road shouldn't be in top 25% of image
+                    # Additional check: contour should be reasonably wide (roads are typically wide)
+                    x, y, w, h_contour = cv2.boundingRect(contour)
+                    aspect_ratio = w / h_contour if h_contour > 0 else 0
+                    
+                    # Only accept contours that look like road segments (wide, not too vertical)
+                    if aspect_ratio > 0.5 and h_contour < h * 0.7:
+                        cv2.drawContours(refined_mask, [contour], -1, 255, -1)
         
         return refined_mask
     
@@ -624,9 +1293,98 @@ def process_video_fixed(input_path: str, output_path: str):
     total_time = time.time() - start_time
     print(f"✓ Complete! Output: {output_path} ({total_time:.1f}s)")
 
-if __name__ == "__main__":
-    # First, debug a single frame to understand the issue
-    debug_single_frame("Road_Lane.mp4", frame_number=100)
+def test_hood_detection(video_path: str, output_path: str = "hood_detection_test.mp4"):
+    """Test hood detection on a video"""
+    # Create detector with fixes
+    config = create_improved_accurate_config()
+    detector = ModernRoadDetector(config)
+    detector = apply_road_detection_fixes(detector, use_smart_hood=True)
     
-    # Then process the full video with fixed detection
-    process_video_fixed("Road_Lane.mp4", "road_detection_fixed.mp4") 
+    # Process video
+    cap = cv2.VideoCapture(video_path)
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    
+    frame_count = 0
+    print(f"Testing smart hood detection on {video_path}...")
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        # Detect road
+        road_mask, _ = detector.detect_road(frame)
+        
+        # Visualize
+        vis = detector.visualize(frame, road_mask, style='freespace')
+        out.write(vis)
+        
+        frame_count += 1
+        if frame_count % 30 == 0:
+            print(f"Processed {frame_count} frames...")
+            
+            # Print hood detection info
+            if hasattr(detector, '_last_hood_result'):
+                hood_result = detector._last_hood_result
+                print(f"  Hood detection: {hood_result.method_used} "
+                      f"({hood_result.confidence:.2f} confidence, "
+                      f"{hood_result.hood_ratio:.1%} coverage)")
+    
+    cap.release()
+    out.release()
+    print(f"✓ Test complete! Output saved to {output_path}")
+
+if __name__ == "__main__":
+    import sys
+    
+    if len(sys.argv) > 1:
+        command = sys.argv[1]
+        
+        if command == "debug" and len(sys.argv) > 2:
+            # Debug a single frame to understand the issue
+            video_file = sys.argv[2]
+            frame_num = int(sys.argv[3]) if len(sys.argv) > 3 else 100
+            debug_single_frame(video_file, frame_num)
+            
+        elif command == "test" and len(sys.argv) > 2:
+            # Test smart hood detection
+            video_file = sys.argv[2]
+            output_file = sys.argv[3] if len(sys.argv) > 3 else "smart_hood_test.mp4"
+            test_hood_detection(video_file, output_file)
+            
+        elif command == "process" and len(sys.argv) > 3:
+            # Process with fixed detection
+            input_file = sys.argv[2]
+            output_file = sys.argv[3]
+            process_video_fixed(input_file, output_file)
+            
+        else:
+            print("Usage:")
+            print("  python stage1_road_detection.py debug <video> [frame_num]")
+            print("  python stage1_road_detection.py test <video> [output]")
+            print("  python stage1_road_detection.py process <input> <output>")
+    else:
+        # Demo smart hood detection setup
+        print("=== Smart Hood Detection Demo ===")
+        
+        # Create improved detector
+        config = create_improved_accurate_config()
+        detector = ModernRoadDetector(config)
+        
+        # Apply smart hood detection fixes
+        detector = apply_road_detection_fixes(detector, use_smart_hood=True)
+        
+        print("✓ Detector ready with smart hood detection!")
+        print("  - Color consistency detection")
+        print("  - Edge pattern analysis")
+        print("  - Geometric shape detection")
+        print("  - Adaptive calibration")
+        print("  - Improved road coverage")
+        print("\nUsage examples:")
+        print("  python stage1_road_detection.py test input_videos/Road_Lane.mp4")
+        print("  python stage1_road_detection.py debug input_videos/Road_Lane.mp4 100") 

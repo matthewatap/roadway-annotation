@@ -75,39 +75,28 @@ def process_single_video(video_path: str, config: RoadDetectionConfig, stages: l
                 ModernRoadDetector, 
                 RoadDetectionValidator,
                 create_improved_accurate_config,
-                create_fast_video_config,
                 apply_road_detection_fixes
             )
             import cv2
             import numpy as np
             
-            # Choose config based on mode - prioritize speed for video processing
+            # Use our improved config that trusts the model's semantic understanding
             if config.model_type == "transformers":
-                # For video processing, use fast config by default
-                # User can force accurate mode by explicitly requesting it
-                if hasattr(config, '_force_accurate') and config._force_accurate:
-                    improved_config = create_improved_accurate_config()
-                    print("Using ACCURATE config (slow but safe)")
-                    print(f"  - Multi-class awareness: {improved_config.multi_class_awareness}")
-                    print(f"  - Advanced refinement: {improved_config.advanced_edge_refinement}")
-                else:
-                    improved_config = create_fast_video_config()
-                    print("Using FAST video config (10x faster)")
-                    print(f"  - Skipping expensive multiclass analysis")
-                    print(f"  - Hood detection still enabled for safety")
+                # Always use the improved accurate config - it's not slow anymore!
+                improved_config = create_improved_accurate_config()
+                print("Using IMPROVED ACCURATE config (trusts SegFormer-B5 semantic understanding)")
+                print(f"  - Multi-class awareness: {improved_config.multi_class_awareness}")
                 print(f"  - Conf threshold: {improved_config.conf_threshold}")
+                print(f"  - Trusts model instead of hardcoded hood values")
             else:
                 improved_config = config
             
             # Initialize detector
             detector = ModernRoadDetector(improved_config)
             
-            # Apply fixes with SMART hood detection (not simple ratio)
+            # Apply minimal enhancements that trust the model's understanding
             detector = apply_road_detection_fixes(detector, use_smart_hood=True)
-            print("Applied smart hood detection and coverage improvements")
-            
-            # Note: Multi-class awareness disabled in fast mode for performance
-            # Hood detection still provides safety by excluding dashboard areas
+            print("Applied minimal enhancements - trusting SegFormer-B5 semantic understanding")
             
             validator = RoadDetectionValidator()
             
@@ -421,8 +410,6 @@ def main():
                        help='Stages to run (1-5), default: [1, 2]')
     parser.add_argument('--config', type=str, choices=['fast', 'balanced', 'accurate'], 
                        default='accurate', help='Processing configuration')
-    parser.add_argument('--mode', type=str, choices=['auto', 'accurate'], 
-                       default='auto', help='Processing mode: auto (fast video processing) or accurate (slow but safe)')
     
     args = parser.parse_args()
     
@@ -479,13 +466,8 @@ def main():
     
     config = config_presets[args.config]
     
-    # Add mode flag to config
-    if args.mode == 'accurate':
-        config._force_accurate = True
-    
     print(f"\n🚀 Dashcam Annotation Pipeline")
     print(f"   📋 Configuration: {args.config}")
-    print(f"   🔧 Mode: {args.mode}")
     print(f"   🎯 Stages: {args.stages}")
     print(f"   🎬 Videos found: {len(available_videos)}")
     

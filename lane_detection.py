@@ -1,167 +1,208 @@
 #!/usr/bin/env python3
 """
-Advanced Lane Detection using State-of-the-Art Deep Learning Models
-Supports multiple backends: YOLOP, Ultra-Fast-Lane-Detection, LaneATT, CLRNet
+Fixed Lane Detection using Ultra-Fast-Lane-Detection approach
 """
 
 import os
 import cv2
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Tuple
 import json
 import time
-import sys
 from enum import Enum
-
-# For downloading pretrained models
-import requests
-import zipfile
-import tarfile
-from pathlib import Path
 
 class LaneModel(Enum):
     """Available lane detection models"""
-    ULTRA_FAST = "ultra_fast"  # Ultra-Fast-Lane-Detection
-    YOLOP = "yolop"  # You Only Look Once for Panoptic Driving
-    LANEATT = "laneatt"  # LaneATT: Keep Your Eyes on The Lanes
-    CLRNET = "clrnet"  # Cross Layer Refinement Network
-    SCNN = "scnn"  # Spatial CNN
-
+    ULTRA_FAST = "ultra_fast"
+    SCNN_LIKE = "scnn_like"
+    
 @dataclass
 class LaneDetectionConfig:
     """Configuration for lane detection"""
     model: LaneModel = LaneModel.ULTRA_FAST
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     confidence_threshold: float = 0.5
-    nms_threshold: float = 0.5
-    max_lanes: int = 8
-    input_size: Tuple[int, int] = (800, 320)  # width, height for Ultra-Fast
-    use_fp16: bool = True if torch.cuda.is_available() else False
-    batch_size: int = 1
+    max_lanes: int = 4
+    input_size: Tuple[int, int] = (800, 288)  # width, height
+    row_anchors: List[float] = None  # Will be initialized in __post_init__
+    griding_num: int = 200  # Number of horizontal grids
+    use_fp16: bool = False
     visualize: bool = True
-    save_raw_output: bool = True
+    
+    def __post_init__(self):
+        if self.row_anchors is None:
+            # Create row anchors from top to bottom of the image
+            # Start from 0.4 (40% from top) to 1.0 (bottom)
+            self.row_anchors = np.linspace(0.4, 1.0, 56).tolist()
 
-class UltraFastLaneDetector:
-    """Ultra-Fast-Lane-Detection implementation"""
+class FixedUltraFastLaneNet(nn.Module):
+    """Fixed Ultra-Fast Lane Detection Network"""
+    
+    def __init__(self, num_lanes=4, num_row_anchors=56, num_cols=201, backbone='resnet34'):
+        super().__init__()
+        
+        self.num_lanes = num_lanes
+        self.num_row_anchors = num_row_anchors
+        self.num_cols = num_cols  # 200 columns + 1 for background
+        
+        # Use ResNet backbone
+        if backbone == 'resnet34':
+            import torchvision.models as models
+            resnet = models.resnet34(pretrained=True)
+            self.backbone = nn.Sequential(*list(resnet.children())[:-2])
+            backbone_channels = 512
+        else:
+            # Simple CNN backbone
+            self.backbone = nn.Sequential(
+                nn.Conv2d(3, 64, 7, stride=2, padding=3),
+                nn.BatchNorm2d(64),
+                nn.ReLU(inplace=True),
+                nn.MaxPool2d(3, stride=2, padding=1),
+                
+                nn.Conv2d(64, 128, 3, stride=2, padding=1),
+                nn.BatchNorm2d(128),
+                nn.ReLU(inplace=True),
+                
+                nn.Conv2d(128, 256, 3, stride=2, padding=1),
+                nn.BatchNorm2d(256),
+                nn.ReLU(inplace=True),
+                
+                nn.Conv2d(256, 512, 3, stride=2, padding=1),
+                nn.BatchNorm2d(512),
+                nn.ReLU(inplace=True),
+            )
+            backbone_channels = 512
+        
+        # Feature aggregation
+        self.conv1 = nn.Conv2d(backbone_channels, 256, 1)
+        self.bn1 = nn.BatchNorm2d(256)
+        self.relu1 = nn.ReLU(inplace=True)
+        
+        # Global features
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        
+        # Additional local features
+        self.local_conv = nn.Conv2d(backbone_channels, 128, 1)
+        self.local_bn = nn.BatchNorm2d(128)
+        self.local_relu = nn.ReLU(inplace=True)
+        self.local_pool = nn.AdaptiveAvgPool2d((4, 8))
+        
+        # Classifier heads
+        feature_size = 256 + 128 * 4 * 8
+        
+        # Main classification head (which column each row anchor belongs to)
+        self.cls_head = nn.Sequential(
+            nn.Linear(feature_size, 1024),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.4),
+            nn.Linear(1024, num_lanes * num_row_anchors * num_cols)
+        )
+        
+        # Auxiliary head for lane existence prediction
+        self.aux_head = nn.Sequential(
+            nn.Linear(feature_size, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.4),
+            nn.Linear(256, num_lanes)
+        )
+        
+    def forward(self, x):
+        # Backbone features
+        feat = self.backbone(x)
+        
+        # Global features
+        global_feat = self.conv1(feat)
+        global_feat = self.bn1(global_feat)
+        global_feat = self.relu1(global_feat)
+        global_feat = self.gap(global_feat)
+        global_feat = global_feat.view(global_feat.size(0), -1)
+        
+        # Local features
+        local_feat = self.local_conv(feat)
+        local_feat = self.local_bn(local_feat)
+        local_feat = self.local_relu(local_feat)
+        local_feat = self.local_pool(local_feat)
+        local_feat = local_feat.view(local_feat.size(0), -1)
+        
+        # Concatenate features
+        feat_concat = torch.cat([global_feat, local_feat], dim=1)
+        
+        # Classification output
+        cls_out = self.cls_head(feat_concat)
+        cls_out = cls_out.view(-1, self.num_lanes, self.num_row_anchors, self.num_cols)
+        
+        # Auxiliary output (lane existence)
+        aux_out = self.aux_head(feat_concat)
+        aux_out = torch.sigmoid(aux_out)
+        
+        return {'cls_out': cls_out, 'aux_out': aux_out}
+
+class FixedUltraFastLaneDetector:
+    """Fixed Ultra-Fast Lane Detector"""
     
     def __init__(self, config: LaneDetectionConfig):
         self.config = config
         self.device = torch.device(config.device)
-        self.model = None
-        self._load_model()
+        self.model = self._create_model()
         
-    def _load_model(self):
-        """Load Ultra-Fast-Lane-Detection model"""
-        print("Loading Ultra-Fast-Lane-Detection model...")
+    def _create_model(self):
+        """Create and initialize the model"""
+        print("Creating Ultra-Fast Lane Detection model...")
         
-        # Import the model architecture
-        try:
-            from models.ultra_fast_lane import UltraFastLaneNet
-        except ImportError:
-            # If not available, use a simplified version
-            self.model = self._create_simple_ultra_fast_model()
-            return
-            
-        # Load pretrained weights
-        model_path = self._download_model_weights()
-        self.model = UltraFastLaneNet(pretrained=False)
+        model = FixedUltraFastLaneNet(
+            num_lanes=self.config.max_lanes,
+            num_row_anchors=len(self.config.row_anchors),
+            num_cols=self.config.griding_num + 1,  # +1 for background
+            backbone='resnet34'
+        )
         
-        if os.path.exists(model_path):
-            checkpoint = torch.load(model_path, map_location=self.device)
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-        
-        self.model.to(self.device)
-        self.model.eval()
-        
-        if self.config.use_fp16:
-            self.model.half()
-    
-    def _create_simple_ultra_fast_model(self):
-        """Create a simplified Ultra-Fast model using ResNet backbone"""
-        import torchvision.models as models
-        
-        class SimpleUltraFast(torch.nn.Module):
-            def __init__(self, num_lanes=4, num_classes=56):
-                super().__init__()
-                # Use ResNet18 as backbone
-                resnet = models.resnet18(pretrained=True)
-                self.backbone = torch.nn.Sequential(*list(resnet.children())[:-2])
-                
-                # Lane detection heads
-                self.cls_head = torch.nn.Conv2d(512, num_lanes * num_classes, 1)
-                self.aux_head = torch.nn.Conv2d(512, num_lanes * 4, 1)  # auxiliary branch
-                
-                self.num_lanes = num_lanes
-                self.num_classes = num_classes
-                
-            def forward(self, x):
-                feat = self.backbone(x)
-                
-                # Global average pooling
-                feat = F.adaptive_avg_pool2d(feat, 1)
-                
-                # Classification output
-                cls_out = self.cls_head(feat).view(-1, self.num_lanes, self.num_classes)
-                
-                # Auxiliary output (for lane existence)
-                aux_out = self.aux_head(feat).view(-1, self.num_lanes, 4)
-                
-                return {'cls_out': cls_out, 'aux_out': aux_out}
-        
-        model = SimpleUltraFast()
         model.to(self.device)
         model.eval()
-        return model
-    
-    def _download_model_weights(self):
-        """Download pretrained weights if not available"""
-        weights_dir = Path("weights/ultra_fast")
-        weights_dir.mkdir(parents=True, exist_ok=True)
         
-        model_path = weights_dir / "tusimple_res18.pth"
-        
-        if not model_path.exists():
-            print("Downloading Ultra-Fast-Lane-Detection weights...")
-            # URL for pretrained weights (you'll need to host or find these)
-            url = "https://github.com/cfzd/Ultra-Fast-Lane-Detection/releases/download/v1/tusimple_res18.pth"
+        if self.config.use_fp16 and self.config.device == "cuda":
+            model.half()
             
-            try:
-                response = requests.get(url)
-                with open(model_path, 'wb') as f:
-                    f.write(response.content)
-            except:
-                print("Warning: Could not download pretrained weights. Using random initialization.")
-        
-        return str(model_path)
+        return model
     
     def detect_lanes(self, image: np.ndarray) -> Dict[str, Any]:
         """Detect lanes in image"""
+        h, w = image.shape[:2]
+        
         # Preprocess
         input_tensor = self._preprocess(image)
         
         # Inference
         with torch.no_grad():
-            if self.config.use_fp16:
+            if self.config.use_fp16 and self.config.device == "cuda":
                 input_tensor = input_tensor.half()
             
             output = self.model(input_tensor)
         
         # Postprocess
-        lanes = self._postprocess(output, image.shape)
+        lanes = self._postprocess(output, (h, w))
+        
+        # Extract confidence from auxiliary output
+        lane_probs = output['aux_out'].cpu().numpy()[0]
+        confidences = [float(prob) for prob, lane in zip(lane_probs, lanes) if len(lane) > 0]
         
         return {
             'lanes': lanes,
-            'confidence': [0.8] * len(lanes),  # Placeholder confidence
-            'raw_output': output if self.config.save_raw_output else None
+            'confidence': confidences,
+            'raw_output': output if hasattr(self.config, 'save_raw_output') and self.config.save_raw_output else None
         }
     
     def _preprocess(self, image: np.ndarray) -> torch.Tensor:
         """Preprocess image for model input"""
         # Resize
         resized = cv2.resize(image, self.config.input_size)
+        
+        # Convert to RGB if needed
+        if len(resized.shape) == 2:
+            resized = cv2.cvtColor(resized, cv2.COLOR_GRAY2RGB)
         
         # Normalize
         normalized = resized.astype(np.float32) / 255.0
@@ -175,218 +216,198 @@ class UltraFastLaneDetector:
     
     def _postprocess(self, output: Dict, original_shape: Tuple) -> List[np.ndarray]:
         """Convert model output to lane coordinates"""
-        cls_out = output['cls_out']
+        h, w = original_shape
         
-        # Get predicted lane points
-        _, predicted = cls_out.max(dim=2)
-        predicted = predicted.cpu().numpy()[0]
+        # Get classification output
+        cls_out = output['cls_out'][0]  # Shape: [num_lanes, num_row_anchors, num_cols]
+        aux_out = output['aux_out'][0]  # Shape: [num_lanes]
         
+        # Process each lane
         lanes = []
-        h, w = original_shape[:2]
         
-        # Convert row anchors to coordinates
-        row_anchors = np.linspace(0.4, 1.0, self.model.num_classes)
-        
-        for lane_idx in range(predicted.shape[0]):
-            lane_points = []
-            for row_idx, col_idx in enumerate(predicted[lane_idx]):
-                if col_idx > 0:  # 0 is background
-                    y = int(row_anchors[row_idx] * h)
-                    x = int(col_idx * w / 100)  # Assuming 100 column grids
-                    lane_points.append([x, y])
+        for lane_idx in range(self.config.max_lanes):
+            # Check if lane exists (confidence > threshold)
+            if aux_out[lane_idx] < self.config.confidence_threshold:
+                continue
             
-            if len(lane_points) > 2:
-                lanes.append(np.array(lane_points))
+            # Get predicted columns for each row anchor
+            lane_cls = cls_out[lane_idx]  # Shape: [num_row_anchors, num_cols]
+            
+            # Apply softmax to get probabilities
+            lane_probs = F.softmax(lane_cls, dim=1)
+            
+            # Get most likely column for each row
+            _, predicted_cols = lane_probs.max(dim=1)
+            predicted_cols = predicted_cols.cpu().numpy()
+            
+            # Also get the confidence
+            max_probs = lane_probs.max(dim=1)[0].cpu().numpy()
+            
+            # Convert to image coordinates
+            lane_points = []
+            for row_idx, (col_idx, prob) in enumerate(zip(predicted_cols, max_probs)):
+                # Skip background class (index 0) or low confidence predictions
+                if col_idx == 0 or prob < 0.5:
+                    continue
+                
+                # Convert row anchor to y coordinate
+                y = int(self.config.row_anchors[row_idx] * h)
+                
+                # Convert column index to x coordinate
+                # col_idx ranges from 1 to griding_num (0 is background)
+                x = int((col_idx - 1) * w / self.config.griding_num)
+                
+                lane_points.append([x, y])
+            
+            # Only add lane if it has enough points
+            if len(lane_points) >= 2:
+                # Sort points by y coordinate (top to bottom)
+                lane_points = sorted(lane_points, key=lambda p: p[1])
+                
+                # Smooth the lane using polynomial fitting
+                lane_array = np.array(lane_points)
+                if len(lane_points) >= 4:
+                    lane_array = self._smooth_lane(lane_array)
+                
+                lanes.append(lane_array)
         
         return lanes
+    
+    def _smooth_lane(self, lane_points: np.ndarray, degree: int = 3) -> np.ndarray:
+        """Smooth lane points using polynomial fitting"""
+        if len(lane_points) < degree + 1:
+            return lane_points
+        
+        # Extract x and y coordinates
+        x = lane_points[:, 0]
+        y = lane_points[:, 1]
+        
+        try:
+            # Fit polynomial
+            coeffs = np.polyfit(y, x, degree)
+            poly = np.poly1d(coeffs)
+            
+            # Generate smooth points
+            y_smooth = np.linspace(y.min(), y.max(), max(len(y), 20))
+            x_smooth = poly(y_smooth)
+            
+            # Ensure x coordinates are within image bounds
+            x_smooth = np.clip(x_smooth, 0, lane_points[:, 0].max() + 50)
+            
+            smooth_lane = np.column_stack([x_smooth, y_smooth])
+            return smooth_lane.astype(np.int32)
+        except:
+            # If fitting fails, return original points
+            return lane_points
 
-class YOLOPDetector:
-    """YOLOP (You Only Look Once for Panoptic driving) detector"""
+class LaneDetectorSCNN:
+    """Alternative SCNN-like detector for comparison"""
     
     def __init__(self, config: LaneDetectionConfig):
         self.config = config
         self.device = torch.device(config.device)
-        self.model = None
-        self._load_model()
-    
-    def _load_model(self):
-        """Load YOLOP model"""
-        print("Loading YOLOP model...")
         
-        # For YOLOP, we'll use a simplified version or download the actual model
-        self.model = self._create_yolop_model()
-    
-    def _create_yolop_model(self):
-        """Create a simplified YOLOP-style model"""
-        class SimpleYOLOP(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                # Shared encoder (backbone)
-                self.backbone = torch.nn.Sequential(
-                    torch.nn.Conv2d(3, 32, 3, stride=2, padding=1),
-                    torch.nn.BatchNorm2d(32),
-                    torch.nn.ReLU(inplace=True),
-                    torch.nn.Conv2d(32, 64, 3, stride=2, padding=1),
-                    torch.nn.BatchNorm2d(64),
-                    torch.nn.ReLU(inplace=True),
-                    torch.nn.Conv2d(64, 128, 3, stride=2, padding=1),
-                    torch.nn.BatchNorm2d(128),
-                    torch.nn.ReLU(inplace=True),
-                    torch.nn.Conv2d(128, 256, 3, stride=2, padding=1),
-                    torch.nn.BatchNorm2d(256),
-                    torch.nn.ReLU(inplace=True),
-                )
-                
-                # Lane detection decoder
-                self.lane_head = torch.nn.Sequential(
-                    torch.nn.Conv2d(256, 128, 3, padding=1),
-                    torch.nn.BatchNorm2d(128),
-                    torch.nn.ReLU(inplace=True),
-                    torch.nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-                    torch.nn.Conv2d(128, 64, 3, padding=1),
-                    torch.nn.BatchNorm2d(64),
-                    torch.nn.ReLU(inplace=True),
-                    torch.nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-                    torch.nn.Conv2d(64, 32, 3, padding=1),
-                    torch.nn.BatchNorm2d(32),
-                    torch.nn.ReLU(inplace=True),
-                    torch.nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-                    torch.nn.Conv2d(32, 1, 1),  # Binary lane segmentation
-                    torch.nn.Sigmoid()
-                )
-            
-            def forward(self, x):
-                feat = self.backbone(x)
-                lane_seg = self.lane_head(feat)
-                
-                # Upsample to original size
-                lane_seg = F.interpolate(lane_seg, size=x.shape[2:], mode='bilinear', align_corners=True)
-                
-                return {'lane_seg': lane_seg}
-        
-        model = SimpleYOLOP()
-        model.to(self.device)
-        model.eval()
-        return model
-    
     def detect_lanes(self, image: np.ndarray) -> Dict[str, Any]:
-        """Detect lanes using YOLOP"""
-        # Preprocess
-        input_tensor = self._preprocess(image)
+        """Detect lanes using traditional CV + CNN approach"""
+        h, w = image.shape[:2]
         
-        # Inference
-        with torch.no_grad():
-            output = self.model(input_tensor)
+        # Convert to grayscale
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         
-        # Postprocess
-        lanes = self._postprocess(output['lane_seg'], image.shape)
+        # Apply Gaussian blur
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        
+        # Edge detection
+        edges = cv2.Canny(blurred, 50, 150)
+        
+        # Region of Interest
+        roi_mask = np.zeros_like(edges)
+        roi_vertices = np.array([
+            [(0, h), (w * 0.4, h * 0.6), (w * 0.6, h * 0.6), (w, h)]
+        ], dtype=np.int32)
+        cv2.fillPoly(roi_mask, roi_vertices, 255)
+        masked_edges = cv2.bitwise_and(edges, roi_mask)
+        
+        # Hough Transform
+        lines = cv2.HoughLinesP(
+            masked_edges,
+            rho=2,
+            theta=np.pi/180,
+            threshold=50,
+            minLineLength=100,
+            maxLineGap=50
+        )
+        
+        # Group lines into lanes
+        lanes = self._group_lines_into_lanes(lines, image.shape)
+        
+        # Generate confidence scores
+        confidences = [0.7] * len(lanes)  # Fixed confidence for traditional method
         
         return {
             'lanes': lanes,
-            'confidence': [0.85] * len(lanes),
-            'segmentation_mask': output['lane_seg'].cpu().numpy()[0, 0]
+            'confidence': confidences
         }
     
-    def _preprocess(self, image: np.ndarray) -> torch.Tensor:
-        """Preprocess image"""
-        # Resize to 640x640 for YOLOP
-        resized = cv2.resize(image, (640, 640))
+    def _group_lines_into_lanes(self, lines, img_shape) -> List[np.ndarray]:
+        """Group detected lines into lanes"""
+        if lines is None:
+            return []
         
-        # Normalize
-        normalized = resized.astype(np.float32) / 255.0
-        
-        # To tensor
-        tensor = torch.from_numpy(normalized.transpose(2, 0, 1))
-        tensor = tensor.unsqueeze(0).to(self.device)
-        
-        return tensor
-    
-    def _postprocess(self, seg_output: torch.Tensor, original_shape: Tuple) -> List[np.ndarray]:
-        """Extract lane coordinates from segmentation output"""
-        # Threshold segmentation
-        seg_mask = (seg_output[0, 0] > 0.5).cpu().numpy()
-        
-        # Resize to original shape
-        h, w = original_shape[:2]
-        seg_mask = cv2.resize(seg_mask.astype(np.uint8), (w, h))
-        
-        # Extract lanes using sliding window or clustering
-        lanes = self._extract_lanes_from_mask(seg_mask)
-        
-        return lanes
-    
-    def _extract_lanes_from_mask(self, mask: np.ndarray) -> List[np.ndarray]:
-        """Extract individual lanes from segmentation mask"""
+        h, w = img_shape[:2]
         lanes = []
-        h, w = mask.shape
         
-        # Use sliding window approach
-        window_width = w // 20
-        stride = window_width // 2
+        # Separate left and right lanes based on slope
+        left_lines = []
+        right_lines = []
         
-        for x_start in range(0, w - window_width, stride):
-            lane_points = []
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
             
-            # For each row, find lane pixels in window
-            for y in range(h // 2, h, 5):  # Start from middle of image
-                window = mask[y, x_start:x_start + window_width]
-                if np.any(window):
-                    # Find center of lane pixels in window
-                    lane_x = x_start + np.mean(np.where(window)[0])
-                    lane_points.append([lane_x, y])
+            # Calculate slope
+            if x2 - x1 == 0:
+                continue
+            slope = (y2 - y1) / (x2 - x1)
             
-            if len(lane_points) > 10:
-                lanes.append(np.array(lane_points))
-        
-        # Merge nearby lanes
-        lanes = self._merge_nearby_lanes(lanes)
-        
-        return lanes
-    
-    def _merge_nearby_lanes(self, lanes: List[np.ndarray], threshold: float = 30) -> List[np.ndarray]:
-        """Merge lanes that are too close together"""
-        if len(lanes) <= 1:
-            return lanes
-        
-        merged = []
-        used = [False] * len(lanes)
-        
-        for i in range(len(lanes)):
-            if used[i]:
+            # Filter by slope
+            if abs(slope) < 0.5:  # Nearly horizontal
                 continue
             
-            current_lane = lanes[i]
-            merge_group = [current_lane]
-            used[i] = True
-            
-            # Find nearby lanes to merge
-            for j in range(i + 1, len(lanes)):
-                if used[j]:
-                    continue
-                
-                # Check distance between lanes
-                other_lane = lanes[j]
-                min_points = min(len(current_lane), len(other_lane))
-                
-                # Sample points for comparison
-                idx1 = np.linspace(0, len(current_lane) - 1, min_points, dtype=int)
-                idx2 = np.linspace(0, len(other_lane) - 1, min_points, dtype=int)
-                
-                avg_dist = np.mean(np.linalg.norm(current_lane[idx1] - other_lane[idx2], axis=1))
-                
-                if avg_dist < threshold:
-                    merge_group.append(other_lane)
-                    used[j] = True
-            
-            # Merge the group
-            if len(merge_group) > 1:
-                # Average the lanes
-                merged_lane = np.mean(merge_group, axis=0)
-                merged.append(merged_lane)
-            else:
-                merged.append(current_lane)
+            if slope < 0:  # Left lane
+                left_lines.append(line[0])
+            else:  # Right lane
+                right_lines.append(line[0])
         
-        return merged
+        # Fit lines to create lanes
+        for lines_group in [left_lines, right_lines]:
+            if len(lines_group) < 2:
+                continue
+            
+            # Extract all points
+            points = []
+            for x1, y1, x2, y2 in lines_group:
+                points.extend([(x1, y1), (x2, y2)])
+            
+            if len(points) < 2:
+                continue
+            
+            points = np.array(points)
+            
+            # Fit a line through the points
+            vx, vy, x0, y0 = cv2.fitLine(points, cv2.DIST_L2, 0, 0.01, 0.01)
+            
+            # Generate lane points
+            lane_points = []
+            for y in np.linspace(h * 0.6, h, 20):
+                if vy[0] != 0:
+                    x = int(x0[0] + (y - y0[0]) * vx[0] / vy[0])
+                    if 0 <= x < w:
+                        lane_points.append([x, int(y)])
+            
+            if len(lane_points) >= 2:
+                lanes.append(np.array(lane_points))
+        
+        return lanes
 
 class AdvancedLaneDetector:
     """Main class that can use different lane detection models"""
@@ -398,12 +419,11 @@ class AdvancedLaneDetector:
     def _create_detector(self):
         """Create the appropriate detector based on config"""
         if self.config.model == LaneModel.ULTRA_FAST:
-            return UltraFastLaneDetector(self.config)
-        elif self.config.model == LaneModel.YOLOP:
-            return YOLOPDetector(self.config)
+            return FixedUltraFastLaneDetector(self.config)
+        elif self.config.model == LaneModel.SCNN_LIKE:
+            return LaneDetectorSCNN(self.config)
         else:
-            # Default to Ultra-Fast
-            return UltraFastLaneDetector(self.config)
+            return FixedUltraFastLaneDetector(self.config)
     
     def process_video(self, input_path: str, output_path: str) -> Dict[str, Any]:
         """Process entire video for lane detection"""
@@ -456,7 +476,7 @@ class AdvancedLaneDetector:
                 
                 total_lanes_detected += len(lanes)
                 
-                # Visualize if enabled
+                # Visualize
                 if self.config.visualize:
                     vis_frame = self._visualize_lanes(frame, lanes, confidences)
                     
@@ -530,8 +550,6 @@ class AdvancedLaneDetector:
             (255, 255, 0),  # Cyan
             (255, 0, 255),  # Magenta
             (0, 255, 255),  # Yellow
-            (128, 255, 128),  # Light green
-            (255, 128, 128),  # Light red
         ]
         
         # Draw each lane
@@ -543,35 +561,48 @@ class AdvancedLaneDetector:
             
             # Draw lane as thick polyline
             pts = lane.astype(np.int32)
-            cv2.polylines(vis_frame, [pts], False, color, thickness=4)
+            cv2.polylines(vis_frame, [pts], False, color, thickness=5)
             
             # Draw points
             for pt in pts[::5]:  # Every 5th point
-                cv2.circle(vis_frame, tuple(pt), 4, color, -1)
+                cv2.circle(vis_frame, tuple(pt), 5, color, -1)
+                cv2.circle(vis_frame, tuple(pt), 7, (255, 255, 255), 2)
             
-            # Add confidence label
+            # Add confidence label at the bottom of the lane
             if len(lane) > 0:
-                label_pos = tuple(lane[0].astype(int))
+                # Find bottom point
+                bottom_pt = lane[np.argmax(lane[:, 1])]
+                label_pos = (int(bottom_pt[0]), int(bottom_pt[1]) - 10)
                 label = f"L{i+1}: {conf:.2f}"
-                cv2.putText(vis_frame, label, (label_pos[0] - 20, label_pos[1] - 10),
+                
+                # Draw label background
+                (text_width, text_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                cv2.rectangle(vis_frame, 
+                            (label_pos[0] - 5, label_pos[1] - text_height - 5),
+                            (label_pos[0] + text_width + 5, label_pos[1] + 5),
+                            (0, 0, 0), -1)
+                
+                cv2.putText(vis_frame, label, label_pos,
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         
         return vis_frame
 
 def main():
-    """Example usage"""
+    """Example usage and testing"""
     import argparse
     
-    parser = argparse.ArgumentParser(description='Advanced Lane Detection')
+    parser = argparse.ArgumentParser(description='Fixed Lane Detection')
     parser.add_argument('input_video', help='Path to input dashcam video')
     parser.add_argument('output_video', help='Path to output video')
     parser.add_argument('--model', type=str, default='ultra_fast', 
-                       choices=['ultra_fast', 'yolop'], 
+                       choices=['ultra_fast', 'scnn_like'], 
                        help='Lane detection model to use')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
                        help='Device to run on (cuda/cpu)')
     parser.add_argument('--confidence', type=float, default=0.5,
                        help='Confidence threshold')
+    parser.add_argument('--max-lanes', type=int, default=4,
+                       help='Maximum number of lanes to detect')
     parser.add_argument('--no-visualize', action='store_true',
                        help='Disable visualization')
     
@@ -582,6 +613,7 @@ def main():
         model=LaneModel(args.model),
         device=args.device,
         confidence_threshold=args.confidence,
+        max_lanes=args.max_lanes,
         visualize=not args.no_visualize
     )
     
@@ -592,9 +624,9 @@ def main():
     print("\nDone!")
 
 if __name__ == "__main__":
-    # If no arguments, run a simple test
+    import sys
     if len(sys.argv) == 1:
-        print("Testing lane detection models...")
+        print("Testing lane detection with fixed model...")
         
         # Test configuration
         config = LaneDetectionConfig(
@@ -613,8 +645,18 @@ if __name__ == "__main__":
         cv2.line(test_img, (400, 720), (500, 400), (255, 255, 255), 5)
         cv2.line(test_img, (880, 720), (780, 400), (255, 255, 255), 5)
         
+        # Add some noise
+        noise = np.random.randint(0, 50, test_img.shape, dtype=np.uint8)
+        test_img = cv2.add(test_img, noise)
+        
         # Test detection
         result = detector.detector.detect_lanes(test_img)
         print(f"Test detection: Found {len(result['lanes'])} lanes")
+        
+        # Visualize
+        if result['lanes']:
+            vis = detector._visualize_lanes(test_img, result['lanes'], result['confidence'])
+            cv2.imwrite("test_lane_detection.jpg", vis)
+            print("Test visualization saved to test_lane_detection.jpg")
     else:
         main() 

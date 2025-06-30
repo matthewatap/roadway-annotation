@@ -456,12 +456,13 @@ def create_fast_video_config():
     )
 
 def create_improved_accurate_config():
-    """Create the unified accurate configuration - trust the model's semantic understanding
+    """Create the unified accurate configuration - NOW USES ULTRA PRECISE (0.9) BY DEFAULT
     
-    NOTE: This now defaults to L4-balanced settings for best quality/performance ratio.
+    Updated to use Ultra Precise config (0.9 confidence) based on user testing.
+    This eliminates car bleeding and provides optimal edge precision.
     Use create_l4_optimized_config() for maximum speed or create_github_exact_accurate_config() for original.
     """
-    return create_l4_balanced_config()  # Use L4 balanced config by default
+    return create_ultra_precise_config()  # Use Ultra Precise (0.9) - best tested config
 
 def create_github_exact_accurate_config():
     """Create the EXACT GitHub 'accurate' configuration (very aggressive, precision-focused)"""
@@ -532,6 +533,72 @@ def create_l4_balanced_config():
         use_tensorrt=False,             # Skip - setup complexity
         use_torch_compile=False,        # Skip - compilation overhead too high
         memory_efficient=True,          # L4 memory optimization
+    )
+
+def create_l4_fast_config():
+    """Create L4 GPU optimized config for maximum speed (single-scale)"""
+    return RoadDetectionConfig(
+        model_type="transformers",
+        
+        # SINGLE-SCALE for 3x speed boost on high-res videos
+        multi_scale=False,
+        scales=[1.0],  # Single scale only
+        
+        # L4 OPTIMIZATIONS
+        use_fp16=True,              # FP16 tensor cores
+        memory_efficient=True,      # CUDNN benchmarking
+        max_resolution=1024,        # Resize to optimal L4 resolution
+        
+        # Quality settings (still excellent)
+        conf_threshold=0.5,         # Good threshold for SegFormer-B5
+        multi_class_awareness=True, # Use semantic understanding
+        
+        # Essential processing only
+        temporal_smooth=True,       # Fast and helpful
+        edge_refinement=True,       # Basic cleanup
+        
+        # DISABLE expensive features for speed
+        advanced_edge_refinement=False,
+        geometric_filtering=False,
+        bilateral_filter=False,
+        perspective_correction=False,
+        
+        # Fast mode
+        fast_processing=True,
+        debug_mode=False
+    )
+
+def create_accurate_fast_config():
+    """Create ACCURATE config (high confidence threshold) with single-scale for speed"""
+    return RoadDetectionConfig(
+        model_type="transformers",
+        
+        # HIGH ACCURACY THRESHOLDS (like GitHub exact accurate)
+        conf_threshold=0.77,                    # High confidence requirement
+        confidence_edge_threshold=0.85,         # Very high edge confidence
+        
+        # SINGLE-SCALE for speed (9.3x faster)
+        multi_scale=False,
+        scales=[1.0],  # Single scale only
+        
+        # ACCURATE PROCESSING (like GitHub config)
+        multi_class_awareness=True,             # Semantic understanding
+        advanced_edge_refinement=True,          # High-quality edge processing
+        geometric_filtering=True,               # Road geometry validation
+        bilateral_filter=True,                  # Edge-preserving smoothing
+        
+        # L4 OPTIMIZATIONS
+        use_fp16=True,                          # FP16 tensor cores
+        memory_efficient=True,                  # CUDNN benchmarking
+        max_resolution=1024,                    # Optimal L4 resolution
+        
+        # Essential processing
+        temporal_smooth=True,
+        edge_refinement=True,
+        
+        # Accurate mode settings
+        fast_processing=False,                  # Quality over speed
+        debug_mode=False
     )
 
 def improve_road_coverage(road_mask, confidence_map, expand_ratio=1.2):
@@ -636,11 +703,24 @@ def apply_road_detection_fixes(detector, use_smart_hood=True):
             
             # Only intervene if hood detection is very confident AND significant
             if smart_hood_percentage > 0.15 and hood_result.confidence > 0.8:
-                print(f"  High-confidence hood detected ({smart_hood_percentage:.1%}), applying minimal exclusion")
+                # Only print occasionally to avoid console flooding
+                if not hasattr(enhanced_detect_with_hood_respect, 'frame_count'):
+                    enhanced_detect_with_hood_respect.frame_count = 0
+                enhanced_detect_with_hood_respect.frame_count += 1
+                
+                if enhanced_detect_with_hood_respect.frame_count % 120 == 1:  # Every 2 seconds at 60fps
+                    print(f"  High-confidence hood detected ({smart_hood_percentage:.1%}), applying minimal exclusion")
+                
                 road_mask[hood_result.hood_mask > 0] = 0
                 confidence_map[hood_result.hood_mask > 0] = 0
             else:
-                print(f"  Trusting model's semantic understanding (hood: {smart_hood_percentage:.1%})")
+                # Only print occasionally to avoid console flooding
+                if not hasattr(enhanced_detect_with_hood_respect, 'frame_count'):
+                    enhanced_detect_with_hood_respect.frame_count = 0
+                enhanced_detect_with_hood_respect.frame_count += 1
+                
+                if enhanced_detect_with_hood_respect.frame_count % 120 == 1:  # Every 2 seconds at 60fps
+                    print(f"  Trusting model's semantic understanding (hood: {smart_hood_percentage:.1%})")
         
         return road_mask, confidence_map
     
@@ -1212,21 +1292,21 @@ class ModernRoadDetector:
             return self._visualize_overlay(frame, road_mask)
     
     def _visualize_freespace(self, frame: np.ndarray, road_mask: np.ndarray) -> np.ndarray:
-        """Clean freespace-style visualization"""
+        """Clean freespace-style visualization with BLUE mask and ORANGE edges"""
         overlay = frame.copy()
         
-        # Semi-transparent blue overlay for road
+        # Semi-transparent BLUE overlay for road (user requested)
         mask_bool = road_mask > 0
-        blue_color = np.array([255, 100, 0])  # BGR - orange-blue
-        overlay[mask_bool] = (overlay[mask_bool] * 0.6 + blue_color * 0.4).astype(np.uint8)
+        blue_color = np.array([255, 0, 0])  # BGR - Pure blue
+        overlay[mask_bool] = (overlay[mask_bool] * 0.7 + blue_color * 0.3).astype(np.uint8)
         
-        # Add orange boundaries
+        # Add ORANGE boundaries (user requested)
         contours, _ = cv2.findContours(road_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(overlay, contours, -1, (0, 165, 255), 2)
+        cv2.drawContours(overlay, contours, -1, (0, 165, 255), 3)  # BGR Orange, thicker line
         
-        # Add info
+        # Add info with Ultra Precise indicator
         coverage = np.sum(road_mask > 0) / (road_mask.shape[0] * road_mask.shape[1]) * 100
-        cv2.putText(overlay, f"Road Detection ({self.model_type})", (10, 30),
+        cv2.putText(overlay, f"Ultra Precise Road Detection (0.9)", (10, 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
         cv2.putText(overlay, f"Coverage: {coverage:.1f}%", (10, 60),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
@@ -1234,11 +1314,17 @@ class ModernRoadDetector:
         return overlay
     
     def _visualize_overlay(self, frame: np.ndarray, road_mask: np.ndarray) -> np.ndarray:
-        """Simple overlay visualization"""
+        """Simple overlay visualization with BLUE mask and ORANGE edges"""
         overlay = frame.copy()
         mask_bool = road_mask > 0
-        overlay[mask_bool] = [0, 255, 0]  # Green overlay
-        return cv2.addWeighted(frame, 0.7, overlay, 0.3, 0)
+        overlay[mask_bool] = [255, 0, 0]  # BGR - Blue overlay (user requested)
+        
+        # Add orange edges for consistency
+        contours, _ = cv2.findContours(road_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        result = cv2.addWeighted(frame, 0.7, overlay, 0.3, 0)
+        cv2.drawContours(result, contours, -1, (0, 165, 255), 2)  # BGR Orange edges
+        
+        return result
     
     def _visualize_debug(self, frame: np.ndarray, road_mask: np.ndarray) -> np.ndarray:
         """Debug visualization with detailed info"""
@@ -1398,37 +1484,48 @@ def process_video_stage1(input_path: str, output_path: str, config: RoadDetectio
     mask_output = output_path.replace('.mp4', '_masks.mp4')
     mask_out = cv2.VideoWriter(mask_output, fourcc, fps, (width, height), isColor=False)
     
+    if not out.isOpened() or not mask_out.isOpened():
+        cap.release()
+        if out.isOpened():
+            out.release()
+        if mask_out.isOpened():
+            mask_out.release()
+        raise RuntimeError("Failed to create video writers")
+    
     print(f"Processing {total_frames} frames...")
     
     frame_count = 0
     start_time = time.time()
     
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        
-        # Detect road
-        road_mask, confidence_map = detector.detect_road(frame)
-        
-        # Visualize
-        result = detector.visualize(frame, road_mask, style='freespace')
-        
-        # Write outputs
-        out.write(result)
-        mask_out.write(road_mask)
-        
-        frame_count += 1
-        
-        if frame_count % 30 == 0:
-            elapsed = time.time() - start_time
-            fps_actual = frame_count / elapsed
-            eta = (total_frames - frame_count) / fps_actual if fps_actual > 0 else 0
-            print(f"Progress: {frame_count}/{total_frames} ({fps_actual:.1f} FPS, ETA: {eta:.0f}s)")
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # Detect road
+            road_mask, confidence_map = detector.detect_road(frame)
+            
+            # Visualize
+            result = detector.visualize(frame, road_mask, style='freespace')
+            
+            # Write outputs
+            out.write(result)
+            mask_out.write(road_mask)
+            
+            frame_count += 1
+            
+            if frame_count % 30 == 0:
+                elapsed = time.time() - start_time
+                fps_actual = frame_count / elapsed
+                eta = (total_frames - frame_count) / fps_actual if fps_actual > 0 else 0
+                print(f"Progress: {frame_count}/{total_frames} ({fps_actual:.1f} FPS, ETA: {eta:.0f}s)")
     
-    cap.release()
-    out.release()
-    mask_out.release()
+    finally:
+        # CRITICAL: Always release video resources to prevent corruption
+        cap.release()
+        out.release()
+        mask_out.release()
     
     total_time = time.time() - start_time
     print(f"✓ Stage 1 completed in {total_time:.1f}s")
@@ -1506,32 +1603,39 @@ def process_video_fixed(input_path: str, output_path: str):
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
     
+    if not out.isOpened():
+        cap.release()
+        raise RuntimeError("Failed to create video writer")
+    
     print(f"Processing {total_frames} frames...")
     
     frame_count = 0
     start_time = time.time()
     
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        
-        # Use fixed detection method
-        road_mask, _ = detector.detect_road(frame)
-        
-        # Visualize
-        result = detector.visualize(frame, road_mask, style='freespace')
-        
-        out.write(result)
-        frame_count += 1
-        
-        if frame_count % 30 == 0:
-            elapsed = time.time() - start_time
-            fps_actual = frame_count / elapsed
-            print(f"Processed {frame_count}/{total_frames} frames ({fps_actual:.1f} FPS)")
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # Use fixed detection method
+            road_mask, _ = detector.detect_road(frame)
+            
+            # Visualize
+            result = detector.visualize(frame, road_mask, style='freespace')
+            
+            out.write(result)
+            frame_count += 1
+            
+            if frame_count % 30 == 0:
+                elapsed = time.time() - start_time
+                fps_actual = frame_count / elapsed
+                print(f"Processed {frame_count}/{total_frames} frames ({fps_actual:.1f} FPS)")
     
-    cap.release()
-    out.release()
+    finally:
+        # CRITICAL: Always release video resources to prevent corruption
+        cap.release()
+        out.release()
     
     total_time = time.time() - start_time
     print(f"✓ Complete! Output: {output_path} ({total_time:.1f}s)")
@@ -1552,35 +1656,140 @@ def test_hood_detection(video_path: str, output_path: str = "hood_detection_test
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
     
+    if not out.isOpened():
+        cap.release()
+        raise RuntimeError("Failed to create video writer")
+    
     frame_count = 0
     print(f"Testing smart hood detection on {video_path}...")
     
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        
-        # Detect road
-        road_mask, _ = detector.detect_road(frame)
-        
-        # Visualize
-        vis = detector.visualize(frame, road_mask, style='freespace')
-        out.write(vis)
-        
-        frame_count += 1
-        if frame_count % 30 == 0:
-            print(f"Processed {frame_count} frames...")
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
             
-            # Print hood detection info
-            if hasattr(detector, '_last_hood_result'):
-                hood_result = detector._last_hood_result
-                print(f"  Hood detection: {hood_result.method_used} "
-                      f"({hood_result.confidence:.2f} confidence, "
-                      f"{hood_result.hood_ratio:.1%} coverage)")
+            # Detect road
+            road_mask, _ = detector.detect_road(frame)
+            
+            # Visualize
+            vis = detector.visualize(frame, road_mask, style='freespace')
+            out.write(vis)
+            
+            frame_count += 1
+            if frame_count % 30 == 0:
+                print(f"Processed {frame_count} frames...")
+                
+                # Print hood detection info
+                if hasattr(detector, '_last_hood_result'):
+                    hood_result = detector._last_hood_result
+                    print(f"  Hood detection: {hood_result.method_used} "
+                          f"({hood_result.confidence:.2f} confidence, "
+                          f"{hood_result.hood_ratio:.1%} coverage)")
     
-    cap.release()
-    out.release()
+    finally:
+        # CRITICAL: Always release video resources to prevent corruption
+        cap.release()
+        out.release()
     print(f"✓ Test complete! Output saved to {output_path}")
+
+def create_conservative_accurate_config():
+    """Create CONSERVATIVE config - addresses car bleeding and edge precision WITHOUT broken geometric filtering"""
+    return RoadDetectionConfig(
+        model_type="transformers",
+        
+        # HIGHER CONFIDENCE THRESHOLDS (reduces car bleeding)
+        conf_threshold=0.85,                    # Higher than 0.77 - less car bleeding
+        confidence_edge_threshold=0.92,         # Much higher edge confidence
+        
+        # AGGRESSIVE CAR/VEHICLE FILTERING
+        multi_class_awareness=True,             # Enable vehicle detection
+        advanced_edge_refinement=True,          # Aggressive person/car removal
+        
+        # EDGE PRECISION WITHOUT BROKEN GEOMETRIC FILTERING
+        geometric_filtering=False,              # DISABLED - was filtering ALL pixels
+        bilateral_filter=True,                  # Edge-preserving smoothing
+        perspective_correction=True,            # Perspective-aware processing
+        edge_refinement=True,                   # Morphological cleanup
+        
+        # SINGLE-SCALE for speed
+        multi_scale=False,
+        scales=[1.0],
+        
+        # L4 OPTIMIZATIONS
+        use_fp16=True,
+        memory_efficient=True,
+        max_resolution=1024,
+        
+        # Quality settings
+        temporal_smooth=True,
+        fast_processing=False,
+        debug_mode=False
+    )
+
+def create_ultra_precise_config():
+    """Create ULTRA PRECISE config - maximum edge precision, minimal car bleeding"""
+    return RoadDetectionConfig(
+        model_type="transformers",
+        
+        # ULTRA HIGH CONFIDENCE (very conservative)
+        conf_threshold=0.9,                     # Only very confident road pixels
+        confidence_edge_threshold=0.95,         # Ultra high edge confidence
+        
+        # MAXIMUM FILTERING
+        multi_class_awareness=True,
+        advanced_edge_refinement=True,
+        geometric_filtering=False,              # DISABLED - was too aggressive
+        bilateral_filter=True,
+        perspective_correction=True,
+        edge_refinement=True,
+        
+        # SINGLE-SCALE
+        multi_scale=False,
+        scales=[1.0],
+        
+        # L4 OPTIMIZATIONS
+        use_fp16=True,
+        memory_efficient=True,
+        max_resolution=1024,
+        
+        # Precision settings
+        temporal_smooth=True,
+        fast_processing=False,
+        debug_mode=False
+    )
+
+def create_edge_tuned_config():
+    """Create EDGE TUNED config - specifically for reducing road edge bleeding"""
+    return RoadDetectionConfig(
+        model_type="transformers",
+        
+        # MODERATE CONFIDENCE with HIGH EDGE PRECISION
+        conf_threshold=0.8,                     # Balanced road detection
+        confidence_edge_threshold=0.95,         # Very high edge precision
+        
+        # FOCUSED ON EDGE PRECISION
+        multi_class_awareness=True,             # Remove cars/people
+        advanced_edge_refinement=True,          # Advanced car removal
+        geometric_filtering=False,              # DISABLED
+        bilateral_filter=True,                  # Strong edge preservation
+        perspective_correction=True,            # Perspective correction
+        edge_refinement=True,                   # Morphological edge cleanup
+        
+        # SINGLE-SCALE
+        multi_scale=False,
+        scales=[1.0],
+        
+        # L4 OPTIMIZATIONS
+        use_fp16=True,
+        memory_efficient=True,
+        max_resolution=1024,
+        
+        # Edge-focused settings
+        temporal_smooth=True,
+        fast_processing=False,
+        debug_mode=False
+    )
 
 if __name__ == "__main__":
     import sys

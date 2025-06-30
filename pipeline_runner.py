@@ -117,7 +117,7 @@ def process_single_video(video_path: str, config: RoadDetectionConfig, stages: l
                 cap.release()
                 raise ValueError("Could not read video properties")
             
-            # Output video
+            # Output video with robust error handling
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             out = cv2.VideoWriter(stage1_output, fourcc, fps, (width, height))
             
@@ -125,58 +125,71 @@ def process_single_video(video_path: str, config: RoadDetectionConfig, stages: l
             mask_output = stage1_output.replace('.mp4', '_masks.mp4')
             mask_out = cv2.VideoWriter(mask_output, fourcc, fps, (width, height), isColor=False)
             
+            if not out.isOpened() or not mask_out.isOpened():
+                cap.release()
+                if out.isOpened():
+                    out.release()
+                if mask_out.isOpened():
+                    mask_out.release()
+                raise RuntimeError("Failed to create video writers")
+            
             print(f"Processing {total_frames} frames...")
             
             frame_count = 0
             processing_start_time = time.time()
             all_metrics = []
             
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                
-                # Detect road with adaptive calibration
-                road_mask, confidence_map = detector.detect_road(frame)
-                
-                # Create metadata for compatibility
-                road_pixels = np.sum(road_mask > 0)
-                total_pixels = road_mask.shape[0] * road_mask.shape[1]
-                road_percentage = (road_pixels / total_pixels) * 100
-                
-                metadata = {
-                    'road_percentage': road_percentage,
-                    'frame_shape': frame.shape[:2],
-                    'model_type': detector.config.model_type,
-                    'hood_exclusion': True,
-                    'coverage_improved': True,
-                    'confidence_threshold': detector.config.conf_threshold,
-                    'frame_count': frame_count
-                }
-                
-                # Validate
-                metrics = validator.calculate_metrics(road_mask)
-                metadata.update(metrics)
-                all_metrics.append(metadata)
-                
-                # Visualize with freespace style
-                result = detector.visualize(frame, road_mask, style='freespace')
-                
-                # Write outputs
-                out.write(result)
-                mask_out.write(road_mask)
-                
-                frame_count += 1
-                
-                if frame_count % 30 == 0:
-                    elapsed = time.time() - processing_start_time
-                    fps_actual = frame_count / elapsed
-                    eta = (total_frames - frame_count) / fps_actual if fps_actual > 0 else 0
-                    print(f"Progress: {frame_count}/{total_frames} ({fps_actual:.1f} FPS, ETA: {eta:.0f}s)")
+            try:
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    
+                    # Detect road with adaptive calibration
+                    road_mask, confidence_map = detector.detect_road(frame)
+                    
+                    # Create metadata for compatibility
+                    road_pixels = np.sum(road_mask > 0)
+                    total_pixels = road_mask.shape[0] * road_mask.shape[1]
+                    road_percentage = (road_pixels / total_pixels) * 100
+                    
+                    metadata = {
+                        'road_percentage': road_percentage,
+                        'frame_shape': frame.shape[:2],
+                        'model_type': detector.config.model_type,
+                        'hood_exclusion': True,
+                        'coverage_improved': True,
+                        'confidence_threshold': detector.config.conf_threshold,
+                        'frame_count': frame_count
+                    }
+                    
+                    # Validate
+                    metrics = validator.calculate_metrics(road_mask)
+                    metadata.update(metrics)
+                    all_metrics.append(metadata)
+                    
+                    # Visualize with freespace style
+                    result = detector.visualize(frame, road_mask, style='freespace')
+                    
+                    # Write outputs
+                    out.write(result)
+                    mask_out.write(road_mask)
+                    
+                    frame_count += 1
+                    
+                    if frame_count % 30 == 0:
+                        elapsed = time.time() - processing_start_time
+                        fps_actual = frame_count / elapsed
+                        eta = (total_frames - frame_count) / fps_actual if fps_actual > 0 else 0
+                        print(f"Progress: {frame_count}/{total_frames} ({fps_actual:.1f} FPS, ETA: {eta:.0f}s)")
             
-            cap.release()
-            out.release()
-            mask_out.release()
+            finally:
+                # CRITICAL: Always release video resources in finally block to prevent corruption
+                print("🔄 Releasing video resources...")
+                cap.release()
+                out.release()
+                mask_out.release()
+                print("✅ Video resources released successfully")
             
             total_time = time.time() - processing_start_time
             
@@ -258,6 +271,10 @@ def process_single_video(video_path: str, config: RoadDetectionConfig, stages: l
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             out = cv2.VideoWriter(stage2_output, fourcc, fps, (width, height))
             
+            if not out.isOpened():
+                cap.release()
+                raise RuntimeError("Failed to create video writer for stage 2")
+            
             # Process frames
             frame_count = 0
             processing_start_time = time.time()
@@ -266,50 +283,53 @@ def process_single_video(video_path: str, config: RoadDetectionConfig, stages: l
             
             print(f"Processing {total_frames} frames for lane detection...")
             
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                
-                # Detect lanes
-                result = lane_detector.detector.detect_lanes(frame)
-                lanes = result['lanes']
-                confidences = result['confidence']
-                
-                # Store results
-                frame_result = {
-                    'frame': frame_count + 1,
-                    'lanes': [lane.tolist() for lane in lanes],
-                    'confidence': confidences,
-                    'timestamp': frame_count / fps
-                }
-                all_lane_results.append(frame_result)
-                total_lanes_detected += len(lanes)
-                
-                # Visualize
-                if lane_config.visualize:
-                    vis_frame = lane_detector._visualize_lanes(frame, lanes, confidences)
+            try:
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
                     
-                    # Add info text
-                    info_text = f"Frame {frame_count+1}/{total_frames} | Lanes: {len(lanes)} | Model: {lane_config.model.value}"
-                    cv2.putText(vis_frame, info_text, (10, 30), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                    # Detect lanes
+                    result = lane_detector.detector.detect_lanes(frame)
+                    lanes = result['lanes']
+                    confidences = result['confidence']
                     
-                    out.write(vis_frame)
-                else:
-                    out.write(frame)
-                
-                frame_count += 1
-                
-                # Progress update
-                if frame_count % 30 == 0:
-                    elapsed = time.time() - processing_start_time
-                    fps_actual = frame_count / elapsed
-                    eta = (total_frames - frame_count) / fps_actual if fps_actual > 0 else 0
-                    print(f"Lane Progress: {frame_count}/{total_frames} ({fps_actual:.1f} FPS, ETA: {eta:.0f}s)")
+                    # Store results
+                    frame_result = {
+                        'frame': frame_count + 1,
+                        'lanes': [lane.tolist() for lane in lanes],
+                        'confidence': confidences,
+                        'timestamp': frame_count / fps
+                    }
+                    all_lane_results.append(frame_result)
+                    total_lanes_detected += len(lanes)
+                    
+                    # Visualize
+                    if lane_config.visualize:
+                        vis_frame = lane_detector._visualize_lanes(frame, lanes, confidences)
+                        
+                        # Add info text
+                        info_text = f"Frame {frame_count+1}/{total_frames} | Lanes: {len(lanes)} | Model: {lane_config.model.value}"
+                        cv2.putText(vis_frame, info_text, (10, 30), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                        
+                        out.write(vis_frame)
+                    else:
+                        out.write(frame)
+                    
+                    frame_count += 1
+                    
+                    # Progress update
+                    if frame_count % 30 == 0:
+                        elapsed = time.time() - processing_start_time
+                        fps_actual = frame_count / elapsed
+                        eta = (total_frames - frame_count) / fps_actual if fps_actual > 0 else 0
+                        print(f"Lane Progress: {frame_count}/{total_frames} ({fps_actual:.1f} FPS, ETA: {eta:.0f}s)")
             
-            cap.release()
-            out.release()
+            finally:
+                # CRITICAL: Always release video resources to prevent corruption
+                cap.release()
+                out.release()
             
             total_time = time.time() - processing_start_time
             avg_lanes = total_lanes_detected / frame_count if frame_count > 0 else 0

@@ -443,6 +443,10 @@ class AdvancedLaneDetector:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
         
+        if not out.isOpened():
+            cap.release()
+            raise RuntimeError("Failed to create video writer")
+        
         # Statistics
         all_results = []
         frame_count = 0
@@ -497,6 +501,7 @@ class AdvancedLaneDetector:
                     print(f"Progress: {frame_count}/{total_frames} ({fps_proc:.1f} FPS, ETA: {eta:.0f}s)")
         
         finally:
+            # CRITICAL: Always release video resources to prevent corruption
             cap.release()
             out.release()
         

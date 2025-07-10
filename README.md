@@ -33,13 +33,59 @@ cd roadway-annotation
 python setup.py
 ```
 
-### 2. Download Test Videos
+### 2. Download Model Weights
+
+#### a. DeepLabV3 (PyTorch)
+```bash
+mkdir -p weights/deeplabv3
+wget -O weights/deeplabv3/deeplabv3_resnet101_cityscapes.pth https://download.pytorch.org/models/deeplabv3_resnet101_coco-586e9e4e.pth
+```
+Note: Ensure that the model path in your configuration matches the downloaded file.
+
+#### b. SegFormer (HuggingFace)
+```bash
+mkdir -p weights/segformer
+wget -O weights/segformer/segformer_b5.pth https://huggingface.co/nvidia/segformer-b5-finetuned-cityscapes-1024-1024/resolve/main/pytorch_model.bin
+```
+Note: Rename the downloaded file to match the expected filename in the pipeline if necessary.
+
+#### c. Ultra-Fast-Lane-Detection
+```bash
+git clone https://github.com/cfzd/Ultra-Fast-Lane-Detection.git
+cd Ultra-Fast-Lane-Detection
+mkdir -p weights/ultrafast
+wget -O weights/ultrafast/culane_18.pth https://github.com/cfzd/Ultra-Fast-Lane-Detection/releases/download/v1.0/culane_18.pth
+cd ..
+```
+Note: Adjust the path in the pipeline configuration to point to weights/ultrafast/culane_18.pth.
+
+#### d. YOLOP
+```bash
+git clone https://github.com/hustvl/YOLOP.git
+cd YOLOP
+mkdir -p weights/yolop
+wget -O weights/yolop/yolop.pth https://github.com/hustvl/YOLOP/releases/download/v1.0/yolop.pth
+cd ..
+```
+Note: Ensure the pipeline configuration points to weights/yolop/yolop.pth.
+
+#### e. LaneATT
+```bash
+git clone https://github.com/harryhan618/LaneATT.git
+cd LaneATT
+mkdir -p weights/laneatt
+wget -O weights/laneatt/tusimple_18.pth https://github.com/harryhan618/LaneATT/releases/download/v1.0/tusimple_18.pth
+cd ..
+```
+Note: Update the pipeline configuration to use weights/laneatt/tusimple_18.pth.
+
+### 3. Download Test Videos
 ```bash
 # Download sample dashcam videos
 gdown --folder 1EQ9o4gpCkAhABGtlYSp8Aqi_nNIaFVYf -O input_videos/
 ```
 
-### 3. Run Pipeline
+### 4. Run Pipeline
 ```bash
 # List available videos
 python pipeline_runner.py --list
@@ -154,72 +200,4 @@ road_mask, debug_vis, pred_classes = detector.debug_detection(frame)
 - OpenCV 4.5+
 - CUDA 11.0+ (optional)
 
-See `requirements.txt` for complete dependency list.
-
-## 🎥 Sample Videos
-
-The pipeline includes 8 test videos covering various scenarios:
-- **Day driving**: `10secondday.mp4`, `20secondday.mp4`, `65secondday.mp4`
-- **Dusk conditions**: `60seconddusk.mp4`
-- **Night driving**: `60secondnight.mp4`
-- **Highway scenes**: `Road_Lane.mp4`, `Road_Lane 2.mp4`
-- **Urban driving**: `80397-572395744_small.mp4`
-
-## 🔬 Technical Details
-
-### Road Detection Models
-- **DeepLabV3**: ResNet-101 backbone, pre-trained on Cityscapes
-- **SegFormer**: Transformer-based, hierarchical feature learning
-- **Classes**: 19 Cityscapes classes (road, sidewalk, building, etc.)
-
-### Lane Detection Models
-- **Ultra-Fast**: Row-wise classification approach
-- **YOLOP**: Multi-task learning (detection + segmentation)
-- **LaneATT**: Attention-based lane detection
-
-### Post-Processing
-- Morphological operations for noise reduction
-- Temporal smoothing across frames
-- Confidence-based edge refinement
-- Geometric constraints (road position priors)
-
-## 📈 Performance Benchmarks
-
-| Configuration | Model | Speed (FPS) | GPU Memory | Quality |
-|---------------|-------|-------------|------------|---------|
-| Fast | DeepLabV3 | 15-20 | 2-3GB | Good |
-| Balanced | DeepLabV3+ | 8-12 | 3-4GB | Very Good |
-| Accurate | SegFormer-B5 | 3-5 | 6-8GB | Excellent |
-
-*Benchmarks on RTX 3080, 1080p video*
-
-## 🤝 Contributing
-
-Contributions are welcome! Please see:
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests if applicable
-5. Submit a pull request
-
-## 📝 License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## 🙏 Acknowledgments
-
-- **PyTorch Team** for DeepLabV3 implementation
-- **HuggingFace** for SegFormer models
-- **Ultra-Fast-Lane-Detection** authors
-- **YOLOP** paper authors
-- **Cityscapes Dataset** for training data
-
-## 📞 Support
-
-- 🐛 **Issues**: [GitHub Issues](https://github.com/matthewatap/roadway-annotation/issues)
-- 💬 **Discussions**: [GitHub Discussions](https://github.com/matthewatap/roadway-annotation/discussions)
-- 📧 **Contact**: Via GitHub Issues
-
----
-
-⭐ **Star this repo if you find it useful!** ⭐ 
+See `requirements.txt` for complete dependency list. 
